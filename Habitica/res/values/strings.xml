@@ -646,6 +646,8 @@
     <string name="login_name">Login Name</string>
     <string name="about">About</string>
     <string name="app_settings">App Settings</string>
+    <string name="disable_yesterdailies_popup">Disable yesterday\'s Dailies popup</string>
+    <string name="disable_yesterdailies_popup_summary">Automatically start the day without asking about yesterday\'s Dailies.</string>
     <string name="authentication">Authentication</string>
     <string name="authentication_summary">Change your authentication options.</string>
     <string name="change_password">Change Password</string>
