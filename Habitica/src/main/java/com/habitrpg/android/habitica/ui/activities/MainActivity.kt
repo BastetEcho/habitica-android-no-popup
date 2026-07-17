@@ -80,6 +80,7 @@ import com.habitrpg.android.habitica.helpers.HitType
 import com.habitrpg.android.habitica.helpers.NotificationOpenHandler
 import com.habitrpg.android.habitica.helpers.ReviewManager
 import com.habitrpg.android.habitica.helpers.SoundManager
+import com.habitrpg.android.habitica.helpers.StartDayManager
 import com.habitrpg.android.habitica.helpers.collectAsStateLifecycleAware
 import com.habitrpg.android.habitica.interactors.CheckClassSelectionUseCase
 import com.habitrpg.android.habitica.interactors.DisplayItemDropUseCase
@@ -650,7 +651,7 @@ open class MainActivity : BaseActivity(), SnackbarActivity {
             navigationController.currentDestination?.let { updateToolbarTitle(it, null) }
         }
 
-        YesterdailyDialog.showDialogIfNeeded(this, viewModel.userViewModel.userID, userRepository, taskRepository)
+        handleStartDay(viewModel.userViewModel.userID)
 
         val openTaskFormType = intent.getStringExtra(OPEN_TASK_FORM_TYPE)
         if (openTaskFormType != null && viewModel.isAuthenticated) {
@@ -776,7 +777,7 @@ open class MainActivity : BaseActivity(), SnackbarActivity {
             handleAnalyticsConsent(user)
 
             displayDeathDialogIfNeeded()
-            YesterdailyDialog.showDialogIfNeeded(this, user.id, userRepository, taskRepository)
+            handleStartDay(user.id)
 
             val quest = user.party?.quest
             if (quest?.completed?.isNotBlank() == true) {
@@ -1117,6 +1118,14 @@ open class MainActivity : BaseActivity(), SnackbarActivity {
         }
     }
 
+    private fun handleStartDay(userId: String?) {
+        if (sharedPreferences.getBoolean(DISABLE_YESTERDAILIES_POPUP_KEY, false)) {
+            StartDayManager.runIfNeeded(userRepository)
+        } else {
+            YesterdailyDialog.showDialogIfNeeded(this, userId, userRepository, taskRepository)
+        }
+    }
+
     private fun updateDrawerBehavior() {
         val layout = drawerLayout ?: return
         val navigationDrawer = findViewById<View>(R.id.navigation_drawer) ?: return
@@ -1165,6 +1174,7 @@ open class MainActivity : BaseActivity(), SnackbarActivity {
     companion object {
         private const val PERSISTENT_DRAWER_MIN_WIDTH_DP = 600
         private const val DEFAULT_SCRIM_COLOR = 0x99000000.toInt()
+        private const val DISABLE_YESTERDAILIES_POPUP_KEY = "disable_yesterdailies_popup"
         const val OPEN_TASK_FORM_TYPE = "openTaskFormType"
     }
 }
