@@ -139,6 +139,12 @@
             android:entryValues="@array/TaskDisplayValues"
             android:defaultValue="standard"
             android:layout="@layout/preference_child_summary"/>
+        <CheckBoxPreference
+            android:key="disable_yesterdailies_popup"
+            android:defaultValue="false"
+            android:title="@string/disable_yesterdailies_popup"
+            android:summary="@string/disable_yesterdailies_popup_summary"
+            android:layout="@layout/preference_child_summary"/>
         <ListPreference
             android:title="@string/launch_screen"
             android:key="launch_screen"
