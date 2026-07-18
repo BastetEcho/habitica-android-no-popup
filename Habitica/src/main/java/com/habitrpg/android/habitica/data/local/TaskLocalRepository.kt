@@ -54,6 +54,8 @@ interface TaskLocalRepository : BaseLocalRepository {
 
     fun getErroredTasks(userID: String): Flow<List<Task>>
 
+    fun getPendingTaskCreations(userID: String): Flow<List<Task>>
+
     fun getUser(userID: String): Flow<User>
 
     fun getTasksForChallenge(

@@ -20,6 +20,7 @@ import com.habitrpg.android.habitica.data.implementation.SetupCustomizationRepos
 import com.habitrpg.android.habitica.data.implementation.SocialRepositoryImpl
 import com.habitrpg.android.habitica.data.implementation.TagRepositoryImpl
 import com.habitrpg.android.habitica.data.implementation.TaskRepositoryImpl
+import com.habitrpg.android.habitica.data.sync.OfflineTaskSyncScheduler
 import com.habitrpg.android.habitica.data.implementation.TutorialRepositoryImpl
 import com.habitrpg.android.habitica.data.implementation.UserRepositoryImpl
 import com.habitrpg.android.habitica.data.local.ChallengeLocalRepository
@@ -71,13 +72,15 @@ class UserRepositoryModule {
         localRepository: TaskLocalRepository,
         apiClient: ApiClient,
         authenticationHandler: AuthenticationHandler,
-        appConfigManager: AppConfigManager
+        appConfigManager: AppConfigManager,
+        offlineTaskSyncScheduler: OfflineTaskSyncScheduler
     ): TaskRepository {
         return TaskRepositoryImpl(
             localRepository,
             apiClient,
             authenticationHandler,
-            appConfigManager
+            appConfigManager,
+            offlineTaskSyncScheduler
         )
     }
 
