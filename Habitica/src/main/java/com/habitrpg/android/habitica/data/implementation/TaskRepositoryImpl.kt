@@ -3,6 +3,7 @@ package com.habitrpg.android.habitica.data.implementation
 import com.habitrpg.android.habitica.data.ApiClient
 import com.habitrpg.android.habitica.data.TaskRepository
 import com.habitrpg.android.habitica.data.local.TaskLocalRepository
+import com.habitrpg.android.habitica.data.sync.OfflineTaskSyncScheduler
 import com.habitrpg.android.habitica.helpers.Analytics
 import com.habitrpg.android.habitica.helpers.AppConfigManager
 import com.habitrpg.android.habitica.helpers.EventCategory
@@ -41,7 +42,8 @@ class TaskRepositoryImpl(
     localRepository: TaskLocalRepository,
     apiClient: ApiClient,
     authenticationHandler: AuthenticationHandler,
-    val appConfigManager: AppConfigManager
+    val appConfigManager: AppConfigManager,
+    private val offlineTaskSyncScheduler: OfflineTaskSyncScheduler
 ) : BaseRepositoryImpl<TaskLocalRepository>(localRepository, apiClient, authenticationHandler),
     TaskRepository {
     private var lastTaskAction: Long = 0
@@ -325,6 +327,7 @@ class TaskRepositoryImpl(
         }
         lastTaskAction = now
 
+        val canQueue = canQueueCreation(task)
         task.isSaving = true
         task.isCreating = true
         task.hasErrored = false
@@ -337,7 +340,9 @@ class TaskRepositoryImpl(
         if (task.id == null) {
             task.id = UUID.randomUUID().toString()
         }
-        localRepository.save(task)
+        if (canQueue) {
+            localRepository.save(task)
+        }
 
         val savedTask =
             if (task.isGroupTask) {
@@ -347,14 +352,34 @@ class TaskRepositoryImpl(
             }
         savedTask?.dateCreated = Date()
         if (savedTask != null) {
+            val localTaskID = task.id
+            if (savedTask.id != localTaskID && localTaskID != null) {
+                localRepository.deleteTask(localTaskID)
+            }
+            if (savedTask.ownerID.isBlank()) {
+                savedTask.ownerID = task.ownerID
+            }
             savedTask.tags = task.tags
+            savedTask.isCreating = false
+            savedTask.isSaving = false
+            savedTask.hasErrored = false
             localRepository.save(savedTask)
-        } else {
+        } else if (canQueue) {
             task.hasErrored = true
             task.isSaving = false
             localRepository.save(task)
+            offlineTaskSyncScheduler.enqueue()
+        } else {
+            task.isSaving = false
+            task.isCreating = false
         }
         return savedTask
+    }
+
+    private fun canQueueCreation(task: Task): Boolean {
+        return !task.isGroupTask &&
+            task.challengeID.isNullOrBlank() &&
+            task.type in setOf(TaskType.HABIT, TaskType.DAILY, TaskType.TODO, TaskType.REWARD)
     }
 
     @Suppress("ReturnCount")
@@ -521,6 +546,19 @@ class TaskRepositoryImpl(
                 updateTask(it, true)
             }
         }
+    }
+
+    override suspend fun syncPendingTaskCreations(): Boolean {
+        val tasks = localRepository.getPendingTaskCreations(currentUserID).firstOrNull().orEmpty()
+        var allSynced = true
+        tasks.map { localRepository.getUnmanagedCopy(it) }
+            .filter(::canQueueCreation)
+            .forEach { task ->
+                if (createTask(task, true) == null) {
+                    allSynced = false
+                }
+            }
+        return allSynced
     }
 
     override suspend fun unlinkAllTasks(

@@ -3,6 +3,7 @@ package com.habitrpg.android.habitica.data.implementation
 import com.habitrpg.android.habitica.data.ApiClient
 import com.habitrpg.android.habitica.data.TaskRepository
 import com.habitrpg.android.habitica.data.local.TaskLocalRepository
+import com.habitrpg.android.habitica.data.sync.OfflineTaskSyncScheduler
 import com.habitrpg.android.habitica.models.BaseObject
 import com.habitrpg.android.habitica.models.tasks.Task
 import com.habitrpg.android.habitica.models.tasks.TaskList
@@ -34,6 +35,7 @@ class TaskRepositoryImplTest : WordSpec({
     lateinit var repository: TaskRepository
     val localRepository = mockk<TaskLocalRepository>()
     val apiClient = mockk<ApiClient>()
+    lateinit var offlineTaskSyncScheduler: OfflineTaskSyncScheduler
     beforeEach {
         val slot = slot<((Realm) -> Unit)>()
         every { localRepository.executeTransaction(transaction = capture(slot)) } answers {
@@ -43,12 +45,14 @@ class TaskRepositoryImplTest : WordSpec({
         every { authenticationHandler.currentUserID } answers {
             ""
         }
+        offlineTaskSyncScheduler = mockk(relaxed = true)
         repository =
             TaskRepositoryImpl(
                 localRepository,
                 apiClient,
                 authenticationHandler,
-                mockk(relaxed = true)
+                mockk(relaxed = true),
+                offlineTaskSyncScheduler
             )
         val liveObjectSlot = slot<BaseObject>()
         every { localRepository.getLiveObject(capture(liveObjectSlot)) } answers {
@@ -63,6 +67,40 @@ class TaskRepositoryImplTest : WordSpec({
             val order = TasksOrder()
             repository.retrieveTasks("", order)
             verify { localRepository.saveTasks("", order, list) }
+        }
+    }
+    "createTask" should {
+        "keep personal tasks locally and schedule a retry when offline" {
+            val task = Task().apply { type = TaskType.TODO }
+            every { localRepository.save(task) } returns Unit
+            coEvery { apiClient.createTask(task) } returns null
+
+            repository.createTask(task)
+
+            task.isCreating shouldBe true
+            task.isSaving shouldBe false
+            task.hasErrored shouldBe true
+            verify(exactly = 2) { localRepository.save(task) }
+            verify(exactly = 1) { offlineTaskSyncScheduler.enqueue() }
+        }
+        "sync only queued personal task creations" {
+            val task = Task().apply {
+                id = UUID.randomUUID().toString()
+                type = TaskType.REWARD
+                isCreating = true
+                hasErrored = true
+            }
+            every { localRepository.getPendingTaskCreations("") } returns flowOf(listOf(task))
+            every { localRepository.getUnmanagedCopy(task) } returns task
+            every { localRepository.save(any<Task>()) } returns Unit
+            coEvery { apiClient.createTask(task) } returns Task().apply {
+                id = task.id
+                type = task.type
+            }
+
+            repository.syncPendingTaskCreations() shouldBe true
+
+            coVerify(exactly = 1) { apiClient.createTask(task) }
         }
     }
     "taskChecked" should {

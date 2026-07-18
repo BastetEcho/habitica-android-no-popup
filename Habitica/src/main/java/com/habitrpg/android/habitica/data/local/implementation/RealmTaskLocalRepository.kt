@@ -70,12 +70,22 @@ class RealmTaskLocalRepository(realm: Realm) :
 
         val allChecklistItems = ArrayList<ChecklistItem>()
         val allReminders = ArrayList<RemindersItem>()
+        val pendingTasks =
+            realm.where(Task::class.java)
+                .equalTo("ownerID", ownerID)
+                .equalTo("isCreating", true)
+                .findAll()
+                .createSnapshot()
         sortedTasks.forEach {
             if (it.ownerID.isBlank()) {
                 it.ownerID = ownerID
             }
             it.checklist?.let { it1 -> allChecklistItems.addAll(it1) }
             it.reminders?.let { it1 -> allReminders.addAll(it1) }
+        }
+        pendingTasks.forEach {
+            it.checklist?.let { checklist -> allChecklistItems.addAll(checklist) }
+            it.reminders?.let { reminders -> allReminders.addAll(reminders) }
         }
         removeOldReminders(allReminders)
         removeOldChecklists(allChecklistItems)
@@ -147,7 +157,10 @@ class RealmTaskLocalRepository(realm: Realm) :
                 .endGroup()
                 .findAll()
                 .createSnapshot()
-        val tasksToDelete = localTasks.filterNot { onlineTaskList.contains(it) }
+        val tasksToDelete =
+            localTasks.filterNot { localTask ->
+                localTask.isCreating || onlineTaskList.contains(localTask)
+            }
         executeTransaction {
             for (localTask in tasksToDelete) {
                 localTask.deleteFromRealm()
@@ -260,6 +273,17 @@ class RealmTaskLocalRepository(realm: Realm) :
         return realm.where(Task::class.java)
             .equalTo("ownerID", userID)
             .equalTo("hasErrored", true)
+            .sort("position")
+            .findAll()
+            .toFlow()
+            .filter { it.isLoaded }
+    }
+
+    override fun getPendingTaskCreations(userID: String): Flow<List<Task>> {
+        return realm.where(Task::class.java)
+            .equalTo("ownerID", userID)
+            .equalTo("hasErrored", true)
+            .equalTo("isCreating", true)
             .sort("position")
             .findAll()
             .toFlow()
