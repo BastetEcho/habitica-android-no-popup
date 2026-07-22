@@ -73,16 +73,19 @@ object Analytics {
     }
 
     fun initialize(context: Context) {
-        amplitude =
-            Amplitude(
-                Configuration(
-                    context.getString(R.string.amplitude_app_id),
-                    context,
-                    optOut = true,
+        val amplitudeAppID = context.getString(R.string.amplitude_app_id)
+        if (amplitudeAppID.isNotBlank()) {
+            amplitude =
+                Amplitude(
+                    Configuration(
+                        amplitudeAppID,
+                        context,
+                        optOut = true,
+                    )
                 )
-            )
+            isInitialized = true
+        }
         FirebasePerformance.getInstance().isPerformanceCollectionEnabled = false
-        isInitialized = true
     }
 
     fun identify(sharedPrefs: SharedPreferences) {
