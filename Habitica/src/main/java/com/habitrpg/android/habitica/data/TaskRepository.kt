@@ -123,6 +123,8 @@ interface TaskRepository : BaseRepository {
 
     suspend fun syncErroredTasks(): List<Task>?
 
+    suspend fun syncPendingTaskCreations(): Boolean
+
     suspend fun unlinkAllTasks(
         challengeID: String?,
         keepOption: String
