@@ -139,12 +139,6 @@
             android:entryValues="@array/TaskDisplayValues"
             android:defaultValue="standard"
             android:layout="@layout/preference_child_summary"/>
-        <CheckBoxPreference
-            android:key="disable_yesterdailies_popup"
-            android:defaultValue="false"
-            android:title="@string/disable_yesterdailies_popup"
-            android:summary="@string/disable_yesterdailies_popup_summary"
-            android:layout="@layout/preference_child_summary"/>
         <ListPreference
             android:title="@string/launch_screen"
             android:key="launch_screen"
@@ -221,6 +215,19 @@
             android:defaultValue="19:30"
             android:title="@string/pref_reminder_picker"
             android:layout="@layout/preference_child_summary" />
+
+    </PreferenceCategory>
+
+    <PreferenceCategory
+        android:title="@string/yesterdailies_reminders_header"
+        android:layout="@layout/preference_category">
+
+        <CheckBoxPreference
+            android:key="yesterdailies_popup_enabled"
+            android:defaultValue="true"
+            android:title="@string/yesterdailies_popup"
+            android:summary="@string/yesterdailies_popup_summary"
+            android:layout="@layout/preference_child_summary"/>
 
     </PreferenceCategory>
 
