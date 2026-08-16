@@ -340,9 +340,7 @@ class TaskRepositoryImpl(
         if (task.id == null) {
             task.id = UUID.randomUUID().toString()
         }
-        if (canQueue) {
-            localRepository.save(task)
-        }
+        localRepository.save(task)
 
         val savedTask =
             if (task.isGroupTask) {
@@ -350,30 +348,36 @@ class TaskRepositoryImpl(
             } else {
                 apiClient.createTask(task)
             }
-        savedTask?.dateCreated = Date()
         if (savedTask != null) {
-            val localTaskID = task.id
-            if (savedTask.id != localTaskID && localTaskID != null) {
-                localRepository.deleteTask(localTaskID)
-            }
-            if (savedTask.ownerID.isBlank()) {
-                savedTask.ownerID = task.ownerID
-            }
-            savedTask.tags = task.tags
-            savedTask.isCreating = false
-            savedTask.isSaving = false
-            savedTask.hasErrored = false
-            localRepository.save(savedTask)
-        } else if (canQueue) {
+            saveCreatedTask(task, savedTask)
+        } else {
             task.hasErrored = true
             task.isSaving = false
             localRepository.save(task)
-            offlineTaskSyncScheduler.enqueue()
-        } else {
-            task.isSaving = false
-            task.isCreating = false
+            if (canQueue) {
+                offlineTaskSyncScheduler.enqueue()
+            }
         }
         return savedTask
+    }
+
+    private fun saveCreatedTask(
+        localTask: Task,
+        savedTask: Task,
+    ) {
+        val localTaskID = localTask.id
+        if (savedTask.id != localTaskID && localTaskID != null) {
+            localRepository.deleteTask(localTaskID)
+        }
+        if (savedTask.ownerID.isBlank()) {
+            savedTask.ownerID = localTask.ownerID
+        }
+        savedTask.dateCreated = savedTask.dateCreated ?: Date()
+        savedTask.tags = localTask.tags
+        savedTask.isCreating = false
+        savedTask.isSaving = false
+        savedTask.hasErrored = false
+        localRepository.save(savedTask)
     }
 
     private fun canQueueCreation(task: Task): Boolean {
@@ -538,27 +542,44 @@ class TaskRepositoryImpl(
     }
 
     override suspend fun syncErroredTasks(): List<Task>? {
-        val tasks = localRepository.getErroredTasks(currentUserID).firstOrNull()
-        return tasks?.map { localRepository.getUnmanagedCopy(it) }?.mapNotNull {
-            if (it.isCreating) {
-                createTask(it, true)
-            } else {
-                updateTask(it, true)
+        val tasks = localRepository.getErroredTasks(currentUserID).firstOrNull() ?: return null
+        val unmanagedTasks = tasks.map { localRepository.getUnmanagedCopy(it) }
+        val (queuedCreations, otherTasks) =
+            unmanagedTasks.partition { task -> task.isCreating && canQueueCreation(task) }
+        return syncQueuedTaskCreations(queuedCreations).filterNotNull() +
+            otherTasks.mapNotNull { task ->
+                if (task.isCreating) {
+                    createTask(task, true)
+                } else {
+                    updateTask(task, true)
+                }
             }
-        }
     }
 
     override suspend fun syncPendingTaskCreations(): Boolean {
         val tasks = localRepository.getPendingTaskCreations(currentUserID).firstOrNull().orEmpty()
-        var allSynced = true
-        tasks.map { localRepository.getUnmanagedCopy(it) }
-            .filter(::canQueueCreation)
-            .forEach { task ->
-                if (createTask(task, true) == null) {
-                    allSynced = false
-                }
+        val queuedTasks =
+            tasks.map { localRepository.getUnmanagedCopy(it) }
+                .filter(::canQueueCreation)
+        return syncQueuedTaskCreations(queuedTasks).all { task -> task != null }
+    }
+
+    private suspend fun syncQueuedTaskCreations(tasks: List<Task>): List<Task?> {
+        if (tasks.isEmpty()) return emptyList()
+        val onlineTasksByID =
+            apiClient.getTasks()?.tasks?.values
+                ?.mapNotNull { task -> task.id?.let { taskID -> taskID to task } }
+                ?.toMap()
+                .orEmpty()
+        return tasks.map { task ->
+            val onlineTask = task.id?.let(onlineTasksByID::get)
+            if (onlineTask != null) {
+                saveCreatedTask(task, onlineTask)
+                onlineTask
+            } else {
+                createTask(task, true)
             }
-        return allSynced
+        }
     }
 
     override suspend fun unlinkAllTasks(

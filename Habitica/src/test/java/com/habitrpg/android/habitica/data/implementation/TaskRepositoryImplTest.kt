@@ -6,6 +6,7 @@ import com.habitrpg.android.habitica.data.local.TaskLocalRepository
 import com.habitrpg.android.habitica.data.sync.OfflineTaskSyncScheduler
 import com.habitrpg.android.habitica.models.BaseObject
 import com.habitrpg.android.habitica.models.tasks.Task
+import com.habitrpg.android.habitica.models.tasks.TaskGroupPlan
 import com.habitrpg.android.habitica.models.tasks.TaskList
 import com.habitrpg.android.habitica.models.user.Stats
 import com.habitrpg.android.habitica.models.user.User
@@ -83,6 +84,23 @@ class TaskRepositoryImplTest : WordSpec({
             verify(exactly = 2) { localRepository.save(task) }
             verify(exactly = 1) { offlineTaskSyncScheduler.enqueue() }
         }
+        "keep unsupported task creations retryable without scheduling background work" {
+            val task =
+                Task().apply {
+                    type = TaskType.TODO
+                    group = TaskGroupPlan().apply { groupID = "group-id" }
+                }
+            every { localRepository.save(task) } returns Unit
+            coEvery { apiClient.createGroupTask("group-id", task) } returns null
+
+            repository.createTask(task)
+
+            task.isCreating shouldBe true
+            task.isSaving shouldBe false
+            task.hasErrored shouldBe true
+            verify(exactly = 2) { localRepository.save(task) }
+            verify(exactly = 0) { offlineTaskSyncScheduler.enqueue() }
+        }
         "sync only queued personal task creations" {
             val task = Task().apply {
                 id = UUID.randomUUID().toString()
@@ -93,6 +111,7 @@ class TaskRepositoryImplTest : WordSpec({
             every { localRepository.getPendingTaskCreations("") } returns flowOf(listOf(task))
             every { localRepository.getUnmanagedCopy(task) } returns task
             every { localRepository.save(any<Task>()) } returns Unit
+            coEvery { apiClient.getTasks() } returns null
             coEvery { apiClient.createTask(task) } returns Task().apply {
                 id = task.id
                 type = task.type
@@ -101,6 +120,67 @@ class TaskRepositoryImplTest : WordSpec({
             repository.syncPendingTaskCreations() shouldBe true
 
             coVerify(exactly = 1) { apiClient.createTask(task) }
+        }
+        "reconcile an already-created server task without creating a duplicate" {
+            val task =
+                Task().apply {
+                    id = UUID.randomUUID().toString()
+                    ownerID = "local-user"
+                    type = TaskType.DAILY
+                    isCreating = true
+                    hasErrored = true
+                }
+            val onlineTask =
+                Task().apply {
+                    id = task.id
+                    type = task.type
+                }
+            val onlineTasks =
+                TaskList().apply {
+                    tasks[onlineTask.id.orEmpty()] = onlineTask
+                }
+            every { localRepository.getPendingTaskCreations("") } returns flowOf(listOf(task))
+            every { localRepository.getUnmanagedCopy(task) } returns task
+            every { localRepository.save(onlineTask) } returns Unit
+            coEvery { apiClient.getTasks() } returns onlineTasks
+
+            repository.syncPendingTaskCreations() shouldBe true
+
+            onlineTask.ownerID shouldBe task.ownerID
+            onlineTask.isCreating shouldBe false
+            onlineTask.hasErrored shouldBe false
+            coVerify(exactly = 0) { apiClient.createTask(any()) }
+            verify(exactly = 1) { localRepository.save(onlineTask) }
+        }
+    }
+    "syncErroredTasks" should {
+        "reconcile a queued creation before the foreground retry path can duplicate it" {
+            val task =
+                Task().apply {
+                    id = UUID.randomUUID().toString()
+                    ownerID = "local-user"
+                    type = TaskType.TODO
+                    isCreating = true
+                    hasErrored = true
+                }
+            val onlineTask =
+                Task().apply {
+                    id = task.id
+                    type = task.type
+                }
+            val onlineTasks =
+                TaskList().apply {
+                    tasks[onlineTask.id.orEmpty()] = onlineTask
+                }
+            every { localRepository.getErroredTasks("") } returns flowOf(listOf(task))
+            every { localRepository.getUnmanagedCopy(task) } returns task
+            every { localRepository.save(onlineTask) } returns Unit
+            coEvery { apiClient.getTasks() } returns onlineTasks
+
+            repository.syncErroredTasks().orEmpty().single() shouldBe onlineTask
+
+            coVerify(exactly = 0) { apiClient.createTask(any()) }
+            verify(exactly = 1) { localRepository.save(onlineTask) }
         }
     }
     "taskChecked" should {
