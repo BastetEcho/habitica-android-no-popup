@@ -46,7 +46,7 @@ interface ApiClient {
 
     // user API
 
-    suspend fun getTasks(): TaskList?
+    suspend fun getTasks(suppressConnectionErrors: Boolean = false): TaskList?
 
     // challenges api
 
@@ -148,7 +148,10 @@ interface ApiClient {
         itemId: String
     ): Task?
 
-    suspend fun createTask(item: Task): Task?
+    suspend fun createTask(
+        item: Task,
+        suppressConnectionErrors: Boolean = false
+    ): Task?
 
     suspend fun createGroupTask(
         groupId: String,

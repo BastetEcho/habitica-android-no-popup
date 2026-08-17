@@ -4,6 +4,7 @@ import com.habitrpg.android.habitica.data.ApiClient
 import com.habitrpg.android.habitica.data.TaskRepository
 import com.habitrpg.android.habitica.data.local.TaskLocalRepository
 import com.habitrpg.android.habitica.data.sync.OfflineTaskSyncScheduler
+import com.habitrpg.android.habitica.data.sync.canQueueOfflineCreation
 import com.habitrpg.android.habitica.helpers.Analytics
 import com.habitrpg.android.habitica.helpers.AppConfigManager
 import com.habitrpg.android.habitica.helpers.EventCategory
@@ -327,7 +328,7 @@ class TaskRepositoryImpl(
         }
         lastTaskAction = now
 
-        val canQueue = canQueueCreation(task)
+        val canQueue = task.canQueueOfflineCreation()
         task.isSaving = true
         task.isCreating = true
         task.hasErrored = false
@@ -335,7 +336,7 @@ class TaskRepositoryImpl(
             if (task.isGroupTask) {
                 task.group?.groupID ?: ""
             } else {
-                authenticationHandler.currentUserID ?: ""
+                authenticationHandler.currentUserID?.takeIf { it.isNotBlank() } ?: task.ownerID
             }
         if (task.id == null) {
             task.id = UUID.randomUUID().toString()
@@ -346,12 +347,12 @@ class TaskRepositoryImpl(
             if (task.isGroupTask) {
                 apiClient.createGroupTask(task.group?.groupID ?: "", task)
             } else {
-                apiClient.createTask(task)
+                apiClient.createTask(task, suppressConnectionErrors = canQueue)
             }
         if (savedTask != null) {
             saveCreatedTask(task, savedTask)
         } else {
-            task.hasErrored = true
+            task.hasErrored = !canQueue
             task.isSaving = false
             localRepository.save(task)
             if (canQueue) {
@@ -378,12 +379,6 @@ class TaskRepositoryImpl(
         savedTask.isSaving = false
         savedTask.hasErrored = false
         localRepository.save(savedTask)
-    }
-
-    private fun canQueueCreation(task: Task): Boolean {
-        return !task.isGroupTask &&
-            task.challengeID.isNullOrBlank() &&
-            task.type in setOf(TaskType.HABIT, TaskType.DAILY, TaskType.TODO, TaskType.REWARD)
     }
 
     @Suppress("ReturnCount")
@@ -545,7 +540,7 @@ class TaskRepositoryImpl(
         val tasks = localRepository.getErroredTasks(currentUserID).firstOrNull() ?: return null
         val unmanagedTasks = tasks.map { localRepository.getUnmanagedCopy(it) }
         val (queuedCreations, otherTasks) =
-            unmanagedTasks.partition { task -> task.isCreating && canQueueCreation(task) }
+            unmanagedTasks.partition { task -> task.isCreating && task.canQueueOfflineCreation() }
         return syncQueuedTaskCreations(queuedCreations).filterNotNull() +
             otherTasks.mapNotNull { task ->
                 if (task.isCreating) {
@@ -557,17 +552,18 @@ class TaskRepositoryImpl(
     }
 
     override suspend fun syncPendingTaskCreations(): Boolean {
+        if (currentUserID.isBlank()) return false
         val tasks = localRepository.getPendingTaskCreations(currentUserID).firstOrNull().orEmpty()
         val queuedTasks =
             tasks.map { localRepository.getUnmanagedCopy(it) }
-                .filter(::canQueueCreation)
+                .filter { task -> task.canQueueOfflineCreation() }
         return syncQueuedTaskCreations(queuedTasks).all { task -> task != null }
     }
 
     private suspend fun syncQueuedTaskCreations(tasks: List<Task>): List<Task?> {
         if (tasks.isEmpty()) return emptyList()
         val onlineTasksByID =
-            apiClient.getTasks()?.tasks?.values
+            apiClient.getTasks(suppressConnectionErrors = true)?.tasks?.values
                 ?.mapNotNull { task -> task.id?.let { taskID -> taskID to task } }
                 ?.toMap()
                 .orEmpty()

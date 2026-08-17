@@ -180,6 +180,7 @@ class RealmTaskLocalRepository(realm: Realm) :
                 .findAll()
                 .createSnapshot()
         val tasksToDelete = localTasks.filterNot { onlineTaskList.contains(it) }
+            .filterNot { it.isCreating }
         executeTransaction {
             for (localTask in tasksToDelete) {
                 localTask.deleteFromRealm()
@@ -282,7 +283,6 @@ class RealmTaskLocalRepository(realm: Realm) :
     override fun getPendingTaskCreations(userID: String): Flow<List<Task>> {
         return realm.where(Task::class.java)
             .equalTo("ownerID", userID)
-            .equalTo("hasErrored", true)
             .equalTo("isCreating", true)
             .sort("position")
             .findAll()

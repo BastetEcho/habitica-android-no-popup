@@ -98,6 +98,20 @@ class ApiClientImpl(
         return process(apiCall, null, true, false)
     }
 
+    private suspend fun <T> process(
+        suppressConnectionErrors: Boolean,
+        apiCall: suspend () -> Response<HabitResponse<T>>
+    ): T? {
+        return try {
+            processResponse(apiCall())
+        } catch (throwable: Throwable) {
+            if (!suppressConnectionErrors || throwable !is IOException || throwable is SSLException) {
+                accept(throwable)
+            }
+            null
+        }
+    }
+
     private suspend fun <T> process(apiCall: suspend () -> Response<HabitResponse<T>>,
                                     onError: ((Throwable) -> T?)? = null,
                                     propagateError: Boolean = true,
@@ -622,7 +636,8 @@ class ApiClientImpl(
         return process { apiService.hatchPet(eggKey, hatchingPotionKey) }
     }
 
-    override suspend fun getTasks(): TaskList? = process { apiService.getTasks(false) }
+    override suspend fun getTasks(suppressConnectionErrors: Boolean): TaskList? =
+        process(suppressConnectionErrors) { apiService.getTasks(false) }
 
     override suspend fun getTasks(type: String): TaskList? {
         return process { apiService.getTasks(type) }
@@ -679,8 +694,11 @@ class ApiClientImpl(
         return process { apiService.scoreChecklistItem(taskId, itemId) }
     }
 
-    override suspend fun createTask(item: Task): Task? {
-        return process { apiService.createTask(item) }
+    override suspend fun createTask(
+        item: Task,
+        suppressConnectionErrors: Boolean
+    ): Task? {
+        return process(suppressConnectionErrors) { apiService.createTask(item) }
     }
 
     override suspend fun createGroupTask(
