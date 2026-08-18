@@ -124,11 +124,15 @@ interface ApiClient {
 
     suspend fun unlockPath(path: String): UnlockResponse?
 
-    suspend fun getTask(id: String): Task?
+    suspend fun getTask(
+        id: String,
+        suppressConnectionErrors: Boolean = false
+    ): Task?
 
     suspend fun postTaskDirection(
         id: String,
-        direction: String
+        direction: String,
+        suppressConnectionErrors: Boolean = false
     ): TaskDirectionData?
 
     suspend fun bulkScoreTasks(data: List<Map<String, String>>): BulkTaskScoringData?

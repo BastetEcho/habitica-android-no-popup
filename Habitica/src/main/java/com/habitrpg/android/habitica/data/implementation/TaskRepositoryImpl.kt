@@ -4,7 +4,9 @@ import com.habitrpg.android.habitica.data.ApiClient
 import com.habitrpg.android.habitica.data.TaskRepository
 import com.habitrpg.android.habitica.data.local.TaskLocalRepository
 import com.habitrpg.android.habitica.data.sync.OfflineTaskSyncScheduler
+import com.habitrpg.android.habitica.data.sync.canQueueOfflineTodoCompletion
 import com.habitrpg.android.habitica.data.sync.canQueueOfflineCreation
+import com.habitrpg.android.habitica.data.sync.isQueuedOfflineTodoCompletion
 import com.habitrpg.android.habitica.helpers.Analytics
 import com.habitrpg.android.habitica.helpers.AppConfigManager
 import com.habitrpg.android.habitica.helpers.EventCategory
@@ -115,6 +117,8 @@ class TaskRepositoryImpl(
         force: Boolean,
         notifyFunc: ((TaskScoringResult) -> Unit)?
     ): TaskScoringResult? {
+        val canQueueTodoCompletion = task.canQueueOfflineTodoCompletion(up)
+        val wasQueuedTodoCompletion = task.isQueuedOfflineTodoCompletion()
         val localData =
             if (user != null && appConfigManager.enableLocalTaskScoring()) {
                 ScoreTaskLocallyInteractor.score(
@@ -142,12 +146,22 @@ class TaskRepositoryImpl(
         val res =
             this.apiClient.postTaskDirection(
                 id,
-                (if (up) TaskDirection.UP else TaskDirection.DOWN).text
-            ) ?: return null
+                (if (up) TaskDirection.UP else TaskDirection.DOWN).text,
+                suppressConnectionErrors = canQueueTodoCompletion
+            )
+        if (res == null) {
+            if (canQueueTodoCompletion) {
+                queueOfflineTodoCompletion(task, schedule = !wasQueuedTodoCompletion)
+            }
+            return null
+        }
+        if (wasQueuedTodoCompletion) {
+            clearQueuedTodoCompletion(task)
+        }
         // There are cases where the user object is not set correctly. So the app refetches it as a fallback
         val thisUser =
             user ?: localRepository.getUser(authenticationHandler.currentUserID ?: "").firstOrNull()
-                ?: return null
+                ?: return if (wasQueuedTodoCompletion) TaskScoringResult() else null
         // save local task changes
 
         Analytics.sendEvent(
@@ -170,6 +184,28 @@ class TaskRepositoryImpl(
         }
         handleTaskResponse(thisUser, res, task, up, localData?.delta ?: 0f)
         return result
+    }
+
+    private fun queueOfflineTodoCompletion(
+        task: Task,
+        schedule: Boolean,
+    ) {
+        val pendingTask = localRepository.getUnmanagedCopy(task)
+        pendingTask.completeForUser(currentUserID, true)
+        pendingTask.hasErrored = true
+        pendingTask.isSaving = true
+        localRepository.save(pendingTask)
+        if (schedule) {
+            offlineTaskSyncScheduler.enqueue()
+        }
+    }
+
+    private fun clearQueuedTodoCompletion(task: Task) {
+        val completedTask = localRepository.getUnmanagedCopy(task)
+        completedTask.completeForUser(currentUserID, true)
+        completedTask.hasErrored = false
+        completedTask.isSaving = false
+        localRepository.save(completedTask)
     }
 
     override suspend fun bulkScoreTasks(data: List<Map<String, String>>): BulkTaskScoringData? {
@@ -539,9 +575,15 @@ class TaskRepositoryImpl(
     override suspend fun syncErroredTasks(): List<Task>? {
         val tasks = localRepository.getErroredTasks(currentUserID).firstOrNull() ?: return null
         val unmanagedTasks = tasks.map { localRepository.getUnmanagedCopy(it) }
-        val (queuedCreations, otherTasks) =
+        val (queuedCreations, nonCreationTasks) =
             unmanagedTasks.partition { task -> task.isCreating && task.canQueueOfflineCreation() }
+        val (queuedTodoCompletions, otherTasks) =
+            nonCreationTasks.partition { task -> task.isQueuedOfflineTodoCompletion() }
+        val todoCompletionResults = syncQueuedTodoCompletions(queuedTodoCompletions)
         return syncQueuedTaskCreations(queuedCreations).filterNotNull() +
+            queuedTodoCompletions.zip(todoCompletionResults).mapNotNull { (task, synced) ->
+                task.takeIf { synced }
+            } +
             otherTasks.mapNotNull { task ->
                 if (task.isCreating) {
                     createTask(task, true)
@@ -557,7 +599,13 @@ class TaskRepositoryImpl(
         val queuedTasks =
             tasks.map { localRepository.getUnmanagedCopy(it) }
                 .filter { task -> task.canQueueOfflineCreation() }
-        return syncQueuedTaskCreations(queuedTasks).all { task -> task != null }
+        val pendingTodoCompletions =
+            localRepository.getPendingTodoCompletions(currentUserID).firstOrNull().orEmpty()
+                .map { localRepository.getUnmanagedCopy(it) }
+                .filter { task -> task.isQueuedOfflineTodoCompletion() }
+        val creationsSynced = syncQueuedTaskCreations(queuedTasks).all { task -> task != null }
+        val completionsSynced = syncQueuedTodoCompletions(pendingTodoCompletions).all { it }
+        return creationsSynced && completionsSynced
     }
 
     private suspend fun syncQueuedTaskCreations(tasks: List<Task>): List<Task?> {
@@ -574,6 +622,27 @@ class TaskRepositoryImpl(
                 onlineTask
             } else {
                 createTask(task, true)
+            }
+        }
+    }
+
+    private suspend fun syncQueuedTodoCompletions(tasks: List<Task>): List<Boolean> {
+        return tasks.map { task ->
+            val taskID = task.id ?: return@map false
+            val onlineTask =
+                apiClient.getTask(taskID, suppressConnectionErrors = true) ?: return@map false
+            if (onlineTask.completed) {
+                if (onlineTask.ownerID.isBlank()) {
+                    onlineTask.ownerID = task.ownerID
+                }
+                onlineTask.position = task.position
+                onlineTask.tags = task.tags
+                onlineTask.hasErrored = false
+                onlineTask.isSaving = false
+                localRepository.save(onlineTask)
+                true
+            } else {
+                taskChecked(null, task, true, true, null) != null
             }
         }
     }

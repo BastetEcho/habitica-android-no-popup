@@ -15,6 +15,7 @@ import android.widget.TextView
 import androidx.core.content.ContextCompat
 import com.habitrpg.android.habitica.R
 import com.habitrpg.android.habitica.data.sync.canQueueOfflineCreation
+import com.habitrpg.android.habitica.data.sync.isQueuedOfflineTodoCompletion
 import com.habitrpg.android.habitica.helpers.GroupPlanInfoProvider
 import com.habitrpg.android.habitica.models.tasks.Task
 import com.habitrpg.android.habitica.ui.viewHolders.BindableViewHolder
@@ -249,9 +250,13 @@ abstract class BaseTaskViewHolder(
             completedCountTextView.visibility = View.GONE
         }
 
-        syncingView?.visibility = if (task?.isSaving == true) View.VISIBLE else View.GONE
         val isQueuedOffline =
-            task?.let { it.isCreating && !it.isSaving && it.canQueueOfflineCreation() } == true
+            task?.let {
+                it.isQueuedOfflineTodoCompletion() ||
+                    it.isCreating && !it.isSaving && it.canQueueOfflineCreation()
+            } == true
+        syncingView?.visibility =
+            if (task?.isSaving == true && !isQueuedOffline) View.VISIBLE else View.GONE
         errorIconView?.visibility =
             if (task?.hasErrored == true && !isQueuedOffline) View.VISIBLE else View.GONE
     }

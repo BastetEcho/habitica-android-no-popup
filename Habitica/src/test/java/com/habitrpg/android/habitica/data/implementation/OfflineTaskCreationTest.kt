@@ -8,7 +8,10 @@ import com.habitrpg.android.habitica.models.BaseObject
 import com.habitrpg.android.habitica.models.tasks.Task
 import com.habitrpg.android.habitica.models.tasks.TaskGroupPlan
 import com.habitrpg.android.habitica.models.tasks.TaskList
+import com.habitrpg.android.habitica.models.user.Stats
+import com.habitrpg.android.habitica.models.user.User
 import com.habitrpg.android.habitica.modules.AuthenticationHandler
+import com.habitrpg.shared.habitica.models.responses.TaskDirectionData
 import com.habitrpg.shared.habitica.models.tasks.TaskType
 import io.kotest.core.spec.style.WordSpec
 import io.kotest.matchers.shouldBe
@@ -51,6 +54,7 @@ class OfflineTaskCreationTest : WordSpec({
         every { localRepository.getLiveObject(capture(liveObjectSlot)) } answers {
             liveObjectSlot.captured
         }
+        every { localRepository.getPendingTodoCompletions(any()) } returns flowOf(emptyList())
     }
     afterEach { clearAllMocks() }
 
@@ -192,6 +196,98 @@ class OfflineTaskCreationTest : WordSpec({
 
             coVerify(exactly = 0) { apiClient.createTask(any(), any()) }
             verify(exactly = 1) { localRepository.save(onlineTask) }
+        }
+    }
+
+    "offline To Do completion" should {
+        "stay completed locally and schedule a silent retry" {
+            authenticatedUserID = "test-user"
+            val task =
+                Task().apply {
+                    id = "todo-id"
+                    ownerID = authenticatedUserID
+                    type = TaskType.TODO
+                }
+            every { localRepository.getUnmanagedCopy(task) } returns task
+            every { localRepository.save(task) } returns Unit
+            coEvery { apiClient.postTaskDirection("todo-id", "up", true) } returns null
+
+            repository.taskChecked(null, task, true, false, null) shouldBe null
+
+            task.completed shouldBe true
+            task.hasErrored shouldBe true
+            task.isSaving shouldBe true
+            verify(exactly = 1) { localRepository.save(task) }
+            verify(exactly = 1) { offlineTaskSyncScheduler.enqueue() }
+        }
+
+        "reconcile an already-completed server task without scoring it twice" {
+            authenticatedUserID = "test-user"
+            val task =
+                Task().apply {
+                    id = "todo-id"
+                    ownerID = authenticatedUserID
+                    type = TaskType.TODO
+                    completed = true
+                    hasErrored = true
+                    isSaving = true
+                }
+            val onlineTask =
+                Task().apply {
+                    id = task.id
+                    type = TaskType.TODO
+                    completed = true
+                }
+            every { localRepository.getPendingTaskCreations(authenticatedUserID) } returns
+                flowOf(emptyList())
+            every { localRepository.getPendingTodoCompletions(authenticatedUserID) } returns
+                flowOf(listOf(task))
+            every { localRepository.getUnmanagedCopy(task) } returns task
+            every { localRepository.save(onlineTask) } returns Unit
+            coEvery { apiClient.getTask("todo-id", true) } returns onlineTask
+
+            repository.syncPendingTaskCreations() shouldBe true
+
+            onlineTask.ownerID shouldBe task.ownerID
+            onlineTask.hasErrored shouldBe false
+            coVerify(exactly = 0) { apiClient.postTaskDirection(any(), any(), any()) }
+            verify(exactly = 1) { localRepository.save(onlineTask) }
+        }
+
+        "submit a persisted completion when connectivity returns" {
+            authenticatedUserID = "test-user"
+            val task =
+                Task().apply {
+                    id = "todo-id"
+                    ownerID = authenticatedUserID
+                    type = TaskType.TODO
+                    completed = true
+                    hasErrored = true
+                    isSaving = true
+                }
+            val onlineTask =
+                Task().apply {
+                    id = task.id
+                    ownerID = task.ownerID
+                    type = TaskType.TODO
+                }
+            val user = User().apply { stats = Stats() }
+            every { localRepository.getPendingTaskCreations(authenticatedUserID) } returns
+                flowOf(emptyList())
+            every { localRepository.getPendingTodoCompletions(authenticatedUserID) } returns
+                flowOf(listOf(task))
+            every { localRepository.getUnmanagedCopy(task) } returns task
+            every { localRepository.getUser(authenticatedUserID) } returns flowOf(user)
+            every { localRepository.save(task) } returns Unit
+            coEvery { apiClient.getTask("todo-id", true) } returns onlineTask
+            coEvery { apiClient.postTaskDirection("todo-id", "up", true) } returns
+                TaskDirectionData()
+
+            repository.syncPendingTaskCreations() shouldBe true
+
+            task.completed shouldBe true
+            task.hasErrored shouldBe false
+            coVerify(exactly = 1) { apiClient.postTaskDirection("todo-id", "up", true) }
         }
     }
 })

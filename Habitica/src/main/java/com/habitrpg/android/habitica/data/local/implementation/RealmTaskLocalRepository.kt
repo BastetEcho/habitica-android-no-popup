@@ -1,6 +1,7 @@
 package com.habitrpg.android.habitica.data.local.implementation
 
 import com.habitrpg.android.habitica.data.local.TaskLocalRepository
+import com.habitrpg.android.habitica.data.sync.isQueuedOfflineTodoCompletion
 import com.habitrpg.android.habitica.models.tasks.ChecklistItem
 import com.habitrpg.android.habitica.models.tasks.RemindersItem
 import com.habitrpg.android.habitica.models.tasks.Task
@@ -73,7 +74,16 @@ class RealmTaskLocalRepository(realm: Realm) :
         val pendingTasks =
             realm.where(Task::class.java)
                 .equalTo("ownerID", ownerID)
+                .beginGroup()
                 .equalTo("isCreating", true)
+                .or()
+                .beginGroup()
+                .equalTo("typeValue", TaskType.TODO.value)
+                .equalTo("completed", true)
+                .equalTo("hasErrored", true)
+                .equalTo("isSaving", true)
+                .endGroup()
+                .endGroup()
                 .findAll()
                 .createSnapshot()
         sortedTasks.forEach {
@@ -90,7 +100,10 @@ class RealmTaskLocalRepository(realm: Realm) :
         removeOldReminders(allReminders)
         removeOldChecklists(allChecklistItems)
 
-        executeTransaction { realm1 -> realm1.insertOrUpdate(sortedTasks) }
+        val pendingTodoIDs =
+            pendingTasks.filter { it.isQueuedOfflineTodoCompletion() }.mapNotNull { it.id }.toSet()
+        val tasksToSave = sortedTasks.filterNot { it.id in pendingTodoIDs }
+        executeTransaction { realm1 -> realm1.insertOrUpdate(tasksToSave) }
     }
 
     override fun saveCompletedTodos(
@@ -179,8 +192,9 @@ class RealmTaskLocalRepository(realm: Realm) :
                 .equalTo("completed", true)
                 .findAll()
                 .createSnapshot()
-        val tasksToDelete = localTasks.filterNot { onlineTaskList.contains(it) }
-            .filterNot { it.isCreating }
+        val tasksToDelete =
+            localTasks.filterNot { onlineTaskList.contains(it) }
+                .filterNot { it.isCreating || it.isQueuedOfflineTodoCompletion() }
         executeTransaction {
             for (localTask in tasksToDelete) {
                 localTask.deleteFromRealm()
@@ -284,6 +298,20 @@ class RealmTaskLocalRepository(realm: Realm) :
         return realm.where(Task::class.java)
             .equalTo("ownerID", userID)
             .equalTo("isCreating", true)
+            .sort("position")
+            .findAll()
+            .toFlow()
+            .filter { it.isLoaded }
+    }
+
+    override fun getPendingTodoCompletions(userID: String): Flow<List<Task>> {
+        return realm.where(Task::class.java)
+            .equalTo("ownerID", userID)
+            .equalTo("typeValue", TaskType.TODO.value)
+            .equalTo("completed", true)
+            .equalTo("hasErrored", true)
+            .equalTo("isSaving", true)
+            .equalTo("isCreating", false)
             .sort("position")
             .findAll()
             .toFlow()

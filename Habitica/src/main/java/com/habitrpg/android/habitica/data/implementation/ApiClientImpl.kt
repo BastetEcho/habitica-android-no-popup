@@ -64,7 +64,6 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import java.io.File
 import java.io.IOException
-import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.Date
@@ -337,21 +336,17 @@ class ApiClientImpl(
 
     fun accept(throwable: Throwable) {
         val throwableClass = throwable.javaClass
-        if (SocketTimeoutException::class.java.isAssignableFrom(throwableClass)) {
+        if (throwable is SocketTimeoutException ||
+            throwable is UnknownHostException ||
+            throwable is IOException && throwable !is SSLException
+        ) {
             return
         }
 
         var isUserInputCall = false
         @Suppress("DEPRECATION")
-        if (SocketException::class.java.isAssignableFrom(throwableClass) ||
-            SSLException::class.java.isAssignableFrom(throwableClass)
-        ) {
+        if (SSLException::class.java.isAssignableFrom(throwableClass)) {
             this.showConnectionProblemDialog(R.string.internal_error_api, isUserInputCall)
-        } else if (throwableClass == SocketTimeoutException::class.java || UnknownHostException::class.java == throwableClass || IOException::class.java == throwableClass) {
-            this.showConnectionProblemDialog(
-                R.string.network_error_no_network_body,
-                isUserInputCall
-            )
         } else if (HttpException::class.java.isAssignableFrom(throwable.javaClass)) {
             val error = throwable as HttpException
             val res = getErrorResponse(error)
@@ -658,15 +653,19 @@ class ApiClientImpl(
         return process { apiService.unlockPath(path) }
     }
 
-    override suspend fun getTask(id: String): Task? {
-        return process { apiService.getTask(id) }
+    override suspend fun getTask(
+        id: String,
+        suppressConnectionErrors: Boolean
+    ): Task? {
+        return process(suppressConnectionErrors) { apiService.getTask(id) }
     }
 
     override suspend fun postTaskDirection(
         id: String,
-        direction: String
+        direction: String,
+        suppressConnectionErrors: Boolean
     ): TaskDirectionData? {
-        return process { apiService.postTaskDirection(id, direction) }
+        return process(suppressConnectionErrors) { apiService.postTaskDirection(id, direction) }
     }
 
     override suspend fun bulkScoreTasks(data: List<Map<String, String>>): BulkTaskScoringData? {

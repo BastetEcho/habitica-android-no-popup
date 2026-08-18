@@ -26,6 +26,20 @@ internal fun Task.canQueueOfflineCreation(): Boolean {
         type in setOf(TaskType.HABIT, TaskType.DAILY, TaskType.TODO, TaskType.REWARD)
 }
 
+internal fun Task.canQueueOfflineTodoCompletion(up: Boolean): Boolean {
+    return up &&
+        !isGroupTask &&
+        challengeID.isNullOrBlank() &&
+        type == TaskType.TODO &&
+        !isCreating
+}
+
+internal fun Task.isQueuedOfflineTodoCompletion(): Boolean {
+    // The otherwise-unused hasErrored + isSaving combination distinguishes a queued score
+    // from an ordinary failed edit without requiring a destructive Realm schema migration.
+    return canQueueOfflineTodoCompletion(true) && completed && hasErrored && isSaving
+}
+
 class OfflineTaskSyncScheduler
     @Inject
     constructor(
