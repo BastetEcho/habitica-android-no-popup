@@ -72,7 +72,7 @@ interface TaskRepository : BaseRepository {
         force: Boolean = false
     ): Task?
 
-    suspend fun deleteTask(taskId: String): Void?
+    suspend fun deleteTask(taskId: String): Boolean
 
     fun saveTask(task: Task)
 

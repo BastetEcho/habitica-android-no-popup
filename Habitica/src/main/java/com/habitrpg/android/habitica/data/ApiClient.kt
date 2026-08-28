@@ -169,7 +169,7 @@ interface ApiClient {
         item: Task
     ): Task?
 
-    suspend fun deleteTask(id: String): Void?
+    suspend fun deleteTask(id: String): Boolean
 
     suspend fun createTag(tag: Tag): Tag?
 

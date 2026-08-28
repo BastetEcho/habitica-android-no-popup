@@ -290,4 +290,52 @@ class OfflineTaskCreationTest : WordSpec({
             coVerify(exactly = 1) { apiClient.postTaskDirection("todo-id", "up", true) }
         }
     }
+
+    "task deletion" should {
+        "cancel a pending local creation without calling the server" {
+            val task =
+                Task().apply {
+                    id = "local-task-id"
+                    type = TaskType.TODO
+                    isCreating = true
+                }
+            every { localRepository.getTaskCopy("local-task-id") } returns flowOf(task)
+            every { localRepository.deleteTask("local-task-id") } returns Unit
+
+            repository.deleteTask("local-task-id") shouldBe true
+
+            coVerify(exactly = 0) { apiClient.deleteTask(any()) }
+            verify(exactly = 1) { localRepository.deleteTask("local-task-id") }
+        }
+
+        "remove a synchronized task locally after the server accepts deletion" {
+            val task =
+                Task().apply {
+                    id = "server-task-id"
+                    type = TaskType.TODO
+                }
+            every { localRepository.getTaskCopy("server-task-id") } returns flowOf(task)
+            every { localRepository.deleteTask("server-task-id") } returns Unit
+            coEvery { apiClient.deleteTask("server-task-id") } returns true
+
+            repository.deleteTask("server-task-id") shouldBe true
+
+            coVerify(exactly = 1) { apiClient.deleteTask("server-task-id") }
+            verify(exactly = 1) { localRepository.deleteTask("server-task-id") }
+        }
+
+        "keep a synchronized task locally when server deletion fails" {
+            val task =
+                Task().apply {
+                    id = "server-task-id"
+                    type = TaskType.TODO
+                }
+            every { localRepository.getTaskCopy("server-task-id") } returns flowOf(task)
+            coEvery { apiClient.deleteTask("server-task-id") } returns false
+
+            repository.deleteTask("server-task-id") shouldBe false
+
+            verify(exactly = 0) { localRepository.deleteTask(any()) }
+        }
+    }
 })

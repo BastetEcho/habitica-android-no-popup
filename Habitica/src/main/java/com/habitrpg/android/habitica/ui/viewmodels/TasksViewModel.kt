@@ -91,6 +91,7 @@ constructor(
     internal fun refreshData(onComplete: () -> Unit) {
         viewModelScope.launch(ExceptionHandler.coroutine()) {
             if (isPersonalBoard) {
+                taskRepository.syncPendingTaskCreations()
                 userRepository.retrieveUser(
                     withTasks = true,
                     forced = true

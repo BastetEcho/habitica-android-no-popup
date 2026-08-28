@@ -1,5 +1,6 @@
 package com.habitrpg.android.habitica.data.implementation
 
+import android.util.Log
 import com.habitrpg.android.habitica.data.ApiClient
 import com.habitrpg.android.habitica.data.TaskRepository
 import com.habitrpg.android.habitica.data.local.TaskLocalRepository
@@ -33,12 +34,17 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import kotlin.time.Duration.Companion.seconds
+
+private val offlineTaskSyncMutex = Mutex()
+private const val OFFLINE_TASK_SYNC_LOG_TAG = "OfflineTaskSync"
 
 @ExperimentalCoroutinesApi
 class TaskRepositoryImpl(
@@ -447,10 +453,16 @@ class TaskRepositoryImpl(
         return savedTask
     }
 
-    override suspend fun deleteTask(taskId: String): Void? {
-        apiClient.deleteTask(taskId) ?: return null
+    override suspend fun deleteTask(taskId: String): Boolean {
+        val localTask = localRepository.getTaskCopy(taskId).firstOrNull()
+        if (localTask?.isCreating == true && localTask.canQueueOfflineCreation()) {
+            localRepository.deleteTask(taskId)
+            Log.i(OFFLINE_TASK_SYNC_LOG_TAG, "Canceled one queued task creation locally.")
+            return true
+        }
+        if (!apiClient.deleteTask(taskId)) return false
         localRepository.deleteTask(taskId)
-        return null
+        return true
     }
 
     override fun saveTask(task: Task) {
@@ -573,39 +585,53 @@ class TaskRepositoryImpl(
     }
 
     override suspend fun syncErroredTasks(): List<Task>? {
-        val tasks = localRepository.getErroredTasks(currentUserID).firstOrNull() ?: return null
-        val unmanagedTasks = tasks.map { localRepository.getUnmanagedCopy(it) }
-        val (queuedCreations, nonCreationTasks) =
-            unmanagedTasks.partition { task -> task.isCreating && task.canQueueOfflineCreation() }
-        val (queuedTodoCompletions, otherTasks) =
-            nonCreationTasks.partition { task -> task.isQueuedOfflineTodoCompletion() }
-        val todoCompletionResults = syncQueuedTodoCompletions(queuedTodoCompletions)
-        return syncQueuedTaskCreations(queuedCreations).filterNotNull() +
-            queuedTodoCompletions.zip(todoCompletionResults).mapNotNull { (task, synced) ->
-                task.takeIf { synced }
-            } +
-            otherTasks.mapNotNull { task ->
-                if (task.isCreating) {
-                    createTask(task, true)
-                } else {
-                    updateTask(task, true)
+        return offlineTaskSyncMutex.withLock {
+            val tasks = localRepository.getErroredTasks(currentUserID).firstOrNull()
+                ?: return@withLock null
+            val unmanagedTasks = tasks.map { localRepository.getUnmanagedCopy(it) }
+            val (queuedCreations, nonCreationTasks) =
+                unmanagedTasks.partition { task -> task.isCreating && task.canQueueOfflineCreation() }
+            val (queuedTodoCompletions, otherTasks) =
+                nonCreationTasks.partition { task -> task.isQueuedOfflineTodoCompletion() }
+            val todoCompletionResults = syncQueuedTodoCompletions(queuedTodoCompletions)
+            syncQueuedTaskCreations(queuedCreations).filterNotNull() +
+                queuedTodoCompletions.zip(todoCompletionResults).mapNotNull { (task, synced) ->
+                    task.takeIf { synced }
+                } +
+                otherTasks.mapNotNull { task ->
+                    if (task.isCreating) {
+                        createTask(task, true)
+                    } else {
+                        updateTask(task, true)
+                    }
                 }
-            }
+        }
     }
 
     override suspend fun syncPendingTaskCreations(): Boolean {
-        if (currentUserID.isBlank()) return false
-        val tasks = localRepository.getPendingTaskCreations(currentUserID).firstOrNull().orEmpty()
-        val queuedTasks =
-            tasks.map { localRepository.getUnmanagedCopy(it) }
-                .filter { task -> task.canQueueOfflineCreation() }
-        val pendingTodoCompletions =
-            localRepository.getPendingTodoCompletions(currentUserID).firstOrNull().orEmpty()
-                .map { localRepository.getUnmanagedCopy(it) }
-                .filter { task -> task.isQueuedOfflineTodoCompletion() }
-        val creationsSynced = syncQueuedTaskCreations(queuedTasks).all { task -> task != null }
-        val completionsSynced = syncQueuedTodoCompletions(pendingTodoCompletions).all { it }
-        return creationsSynced && completionsSynced
+        return offlineTaskSyncMutex.withLock {
+            if (currentUserID.isBlank()) return@withLock false
+            val tasks = localRepository.getPendingTaskCreations(currentUserID).firstOrNull().orEmpty()
+            val queuedTasks =
+                tasks.map { localRepository.getUnmanagedCopy(it) }
+                    .filter { task -> task.canQueueOfflineCreation() }
+            val pendingTodoCompletions =
+                localRepository.getPendingTodoCompletions(currentUserID).firstOrNull().orEmpty()
+                    .map { localRepository.getUnmanagedCopy(it) }
+                    .filter { task -> task.isQueuedOfflineTodoCompletion() }
+            Log.i(
+                OFFLINE_TASK_SYNC_LOG_TAG,
+                "Syncing ${queuedTasks.size} queued creations and " +
+                    "${pendingTodoCompletions.size} queued completions."
+            )
+            val creationsSynced = syncQueuedTaskCreations(queuedTasks).all { task -> task != null }
+            val completionsSynced = syncQueuedTodoCompletions(pendingTodoCompletions).all { it }
+            Log.i(
+                OFFLINE_TASK_SYNC_LOG_TAG,
+                "Queued sync finished: creations=$creationsSynced, completions=$completionsSynced."
+            )
+            creationsSynced && completionsSynced
+        }
     }
 
     private suspend fun syncQueuedTaskCreations(tasks: List<Task>): List<Task?> {

@@ -718,8 +718,8 @@ class ApiClientImpl(
         return process { apiService.updateTask(id, item) }
     }
 
-    override suspend fun deleteTask(id: String): Void? {
-        return process { apiService.deleteTask(id) }
+    override suspend fun deleteTask(id: String): Boolean {
+        return processWithIfSuccess { apiService.deleteTask(id) }
     }
 
     override suspend fun createTag(tag: Tag): Tag? {
