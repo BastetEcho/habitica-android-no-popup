@@ -2,6 +2,7 @@ package com.habitrpg.android.habitica.data.local.implementation
 
 import com.habitrpg.android.habitica.data.local.TaskLocalRepository
 import com.habitrpg.android.habitica.data.sync.isQueuedOfflineTodoCompletion
+import com.habitrpg.android.habitica.data.sync.offlineCreateAlias
 import com.habitrpg.android.habitica.models.tasks.ChecklistItem
 import com.habitrpg.android.habitica.models.tasks.RemindersItem
 import com.habitrpg.android.habitica.models.tasks.Task
@@ -40,6 +41,7 @@ class RealmTaskLocalRepository(realm: Realm) :
         return realm.where(Task::class.java)
             .equalTo("typeValue", taskType.value)
             .equalTo("ownerID", ownerID)
+            .equalTo("pendingDelete", false)
             .sort("position", Sort.ASCENDING, "dateCreated", Sort.DESCENDING)
             .findAll()
     }
@@ -47,6 +49,7 @@ class RealmTaskLocalRepository(realm: Realm) :
     override fun getTasks(userId: String): Flow<List<Task>> {
         if (realm.isClosed) return emptyFlow()
         return realm.where(Task::class.java).equalTo("ownerID", userId)
+            .equalTo("pendingDelete", false)
             .sort("position", Sort.ASCENDING, "dateCreated", Sort.DESCENDING)
             .findAll()
             .toFlow()
@@ -75,14 +78,13 @@ class RealmTaskLocalRepository(realm: Realm) :
             realm.where(Task::class.java)
                 .equalTo("ownerID", ownerID)
                 .beginGroup()
-                .equalTo("isCreating", true)
+                .equalTo("pendingCreate", true)
                 .or()
-                .beginGroup()
-                .equalTo("typeValue", TaskType.TODO.value)
-                .equalTo("completed", true)
-                .equalTo("hasErrored", true)
-                .equalTo("isSaving", true)
-                .endGroup()
+                .equalTo("pendingDelete", true)
+                .or()
+                .equalTo("pendingPosition", true)
+                .or()
+                .equalTo("pendingScoreUp", true)
                 .endGroup()
                 .findAll()
                 .createSnapshot()
@@ -100,9 +102,13 @@ class RealmTaskLocalRepository(realm: Realm) :
         removeOldReminders(allReminders)
         removeOldChecklists(allChecklistItems)
 
-        val pendingTodoIDs =
-            pendingTasks.filter { it.isQueuedOfflineTodoCompletion() }.mapNotNull { it.id }.toSet()
-        val tasksToSave = sortedTasks.filterNot { it.id in pendingTodoIDs }
+        // Server refreshes must not overwrite the durable local outbox flags before sync replays them.
+        val pendingTaskIDs = pendingTasks.mapNotNull { it.id }.toSet()
+        val pendingTaskAliases = pendingTasks.mapNotNull { it.offlineCreateAlias() }.toSet()
+        val tasksToSave =
+            sortedTasks.filterNot {
+                it.id in pendingTaskIDs || it.alias in pendingTaskAliases
+            }
         executeTransaction { realm1 -> realm1.insertOrUpdate(tasksToSave) }
     }
 
@@ -111,7 +117,41 @@ class RealmTaskLocalRepository(realm: Realm) :
         tasks: MutableCollection<Task>
     ) {
         removeCompletedTodos(userId, tasks)
-        executeTransaction { realm1 -> realm1.insertOrUpdate(tasks) }
+        val pendingTaskIDs =
+            realm.where(Task::class.java)
+                .equalTo("ownerID", userId)
+                .beginGroup()
+                .equalTo("pendingCreate", true)
+                .or()
+                .equalTo("pendingDelete", true)
+                .or()
+                .equalTo("pendingPosition", true)
+                .or()
+                .equalTo("pendingScoreUp", true)
+                .endGroup()
+                .findAll()
+                .mapNotNull { it.id }
+                .toSet()
+        val pendingTaskAliases =
+            realm.where(Task::class.java)
+                .equalTo("ownerID", userId)
+                .beginGroup()
+                .equalTo("pendingCreate", true)
+                .or()
+                .equalTo("pendingDelete", true)
+                .or()
+                .equalTo("pendingPosition", true)
+                .or()
+                .equalTo("pendingScoreUp", true)
+                .endGroup()
+                .findAll()
+                .mapNotNull { it.offlineCreateAlias() }
+                .toSet()
+        val tasksToSave =
+            tasks.filterNot {
+                it.id in pendingTaskIDs || it.alias in pendingTaskAliases
+            }
+        executeTransaction { realm1 -> realm1.insertOrUpdate(tasksToSave) }
     }
 
     private fun removeOldChecklists(onlineItems: List<ChecklistItem>) {
@@ -172,7 +212,11 @@ class RealmTaskLocalRepository(realm: Realm) :
                 .createSnapshot()
         val tasksToDelete =
             localTasks.filterNot { localTask ->
-                localTask.isCreating || onlineTaskList.contains(localTask)
+                localTask.pendingCreate ||
+                    localTask.pendingDelete ||
+                    localTask.pendingPosition ||
+                    localTask.pendingScoreUp ||
+                    onlineTaskList.contains(localTask)
             }
         executeTransaction {
             for (localTask in tasksToDelete) {
@@ -194,7 +238,13 @@ class RealmTaskLocalRepository(realm: Realm) :
                 .createSnapshot()
         val tasksToDelete =
             localTasks.filterNot { onlineTaskList.contains(it) }
-                .filterNot { it.isCreating || it.isQueuedOfflineTodoCompletion() }
+                .filterNot {
+                    it.pendingCreate ||
+                        it.pendingDelete ||
+                        it.pendingPosition ||
+                        it.pendingScoreUp ||
+                        it.isQueuedOfflineTodoCompletion()
+                }
         executeTransaction {
             for (localTask in tasksToDelete) {
                 localTask.deleteFromRealm()
@@ -209,6 +259,27 @@ class RealmTaskLocalRepository(realm: Realm) :
                 task.deleteFromRealm()
             }
         }
+    }
+
+    override fun replaceTask(
+        taskID: String,
+        task: Task,
+    ) {
+        executeTransaction { transactionRealm ->
+            transactionRealm.where(Task::class.java).equalTo("id", taskID).findFirst()
+                ?.deleteFromRealm()
+            transactionRealm.insertOrUpdate(task)
+        }
+    }
+
+    override fun resolveTaskID(
+        taskID: String,
+        alias: String,
+    ): String {
+        if (realm.isClosed) return taskID
+        val directTask = realm.where(Task::class.java).equalTo("id", taskID).findFirst()
+        if (directTask?.id != null) return directTask.id.orEmpty()
+        return realm.where(Task::class.java).equalTo("alias", alias).findFirst()?.id ?: taskID
     }
 
     override fun getTask(taskId: String): Flow<Task> {
@@ -242,9 +313,16 @@ class RealmTaskLocalRepository(realm: Realm) :
         firstPosition: Int,
         secondPosition: Int
     ) {
-        val firstTask = realm.where(Task::class.java).equalTo("position", firstPosition).findFirst()
+        val firstTask =
+            realm.where(Task::class.java)
+                .equalTo("position", firstPosition)
+                .equalTo("pendingDelete", false)
+                .findFirst()
         val secondTask =
-            realm.where(Task::class.java).equalTo("position", secondPosition).findFirst()
+            realm.where(Task::class.java)
+                .equalTo("position", secondPosition)
+                .equalTo("pendingDelete", false)
+                .findFirst()
         if (firstTask != null && secondTask != null && firstTask.isValid && secondTask.isValid) {
             executeTransaction {
                 firstTask.position = secondPosition
@@ -259,6 +337,7 @@ class RealmTaskLocalRepository(realm: Realm) :
     ): Flow<Task> {
         return realm.where(Task::class.java).equalTo("typeValue", taskType)
             .equalTo("position", position)
+            .equalTo("pendingDelete", false)
             .findAll()
             .toFlow()
             .filter { realmObject -> realmObject.isLoaded && realmObject.isNotEmpty() }.mapNotNull { it.first() }
@@ -297,21 +376,34 @@ class RealmTaskLocalRepository(realm: Realm) :
     override fun getPendingTaskCreations(userID: String): Flow<List<Task>> {
         return realm.where(Task::class.java)
             .equalTo("ownerID", userID)
-            .equalTo("isCreating", true)
+            .equalTo("pendingCreate", true)
+            .equalTo("pendingDelete", false)
             .sort("position")
             .findAll()
             .toFlow()
             .filter { it.isLoaded }
     }
 
-    override fun getPendingTodoCompletions(userID: String): Flow<List<Task>> {
+    override fun getPendingTaskDeletions(userID: String): Flow<List<Task>> {
         return realm.where(Task::class.java)
             .equalTo("ownerID", userID)
-            .equalTo("typeValue", TaskType.TODO.value)
-            .equalTo("completed", true)
-            .equalTo("hasErrored", true)
-            .equalTo("isSaving", true)
-            .equalTo("isCreating", false)
+            .equalTo("pendingDelete", true)
+            .sort("position")
+            .findAll()
+            .toFlow()
+            .filter { it.isLoaded }
+    }
+
+    override fun getPendingTaskActions(userID: String): Flow<List<Task>> {
+        return realm.where(Task::class.java)
+            .equalTo("ownerID", userID)
+            .equalTo("pendingCreate", false)
+            .equalTo("pendingDelete", false)
+            .beginGroup()
+            .equalTo("pendingPosition", true)
+            .or()
+            .equalTo("pendingScoreUp", true)
+            .endGroup()
             .sort("position")
             .findAll()
             .toFlow()

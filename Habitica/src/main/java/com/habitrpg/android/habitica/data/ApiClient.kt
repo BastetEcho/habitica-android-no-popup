@@ -39,6 +39,12 @@ import com.habitrpg.shared.habitica.models.responses.VerifyEmailResponse
 import com.habitrpg.shared.habitica.models.responses.VerifyUsernameResponse
 import retrofit2.HttpException
 
+enum class TaskServerState {
+    PRESENT,
+    MISSING,
+    UNKNOWN,
+}
+
 interface ApiClient {
     val hostConfig: HostConfig
 
@@ -129,6 +135,8 @@ interface ApiClient {
         suppressConnectionErrors: Boolean = false
     ): Task?
 
+    suspend fun getTaskServerState(id: String): TaskServerState
+
     suspend fun postTaskDirection(
         id: String,
         direction: String,
@@ -139,7 +147,8 @@ interface ApiClient {
 
     suspend fun postTaskNewPosition(
         id: String,
-        position: Int
+        position: Int,
+        suppressConnectionErrors: Boolean = false,
     ): List<String>?
 
     suspend fun postGroupTaskNewPosition(
@@ -169,7 +178,10 @@ interface ApiClient {
         item: Task
     ): Task?
 
-    suspend fun deleteTask(id: String): Boolean
+    suspend fun deleteTask(
+        id: String,
+        suppressConnectionErrors: Boolean = false,
+    ): Boolean
 
     suspend fun createTag(tag: Tag): Tag?
 

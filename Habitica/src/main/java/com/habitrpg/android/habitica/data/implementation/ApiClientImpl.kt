@@ -8,6 +8,7 @@ import com.habitrpg.android.habitica.R
 import com.habitrpg.android.habitica.api.ApiService
 import com.habitrpg.android.habitica.api.GSonFactoryCreator
 import com.habitrpg.android.habitica.data.ApiClient
+import com.habitrpg.android.habitica.data.TaskServerState
 import com.habitrpg.android.habitica.helpers.Analytics
 import com.habitrpg.android.habitica.helpers.NotificationsManager
 import com.habitrpg.android.habitica.models.Achievement
@@ -104,11 +105,16 @@ class ApiClientImpl(
         return try {
             processResponse(apiCall())
         } catch (throwable: Throwable) {
-            if (!suppressConnectionErrors || throwable !is IOException || throwable is SSLException) {
+            if (!suppressConnectionErrors || !throwable.isExpectedOfflineFailure()) {
                 accept(throwable)
             }
             null
         }
+    }
+
+    private fun Throwable.isExpectedOfflineFailure(): Boolean {
+        return this is HttpException && code() == 404 ||
+            this is IOException && this !is SSLException
     }
 
     private suspend fun <T> process(apiCall: suspend () -> Response<HabitResponse<T>>,
@@ -134,12 +140,17 @@ class ApiClientImpl(
         return null
     }
 
-    private suspend fun <T> processWithIfSuccess(apiCall: suspend () -> Response<HabitResponse<T>>): Boolean {
+    private suspend fun <T> processWithIfSuccess(
+        suppressConnectionErrors: Boolean = false,
+        apiCall: suspend () -> Response<HabitResponse<T>>,
+    ): Boolean {
         try {
             processResponse(apiCall())
             return true
         } catch (throwable: Throwable) {
-            accept(throwable)
+            if (!suppressConnectionErrors || !throwable.isExpectedOfflineFailure()) {
+                accept(throwable)
+            }
             return false
         }
     }
@@ -660,6 +671,26 @@ class ApiClientImpl(
         return process(suppressConnectionErrors) { apiService.getTask(id) }
     }
 
+    override suspend fun getTaskServerState(id: String): TaskServerState {
+        return try {
+            if (processResponse(apiService.getTask(id)) != null) {
+                TaskServerState.PRESENT
+            } else {
+                TaskServerState.UNKNOWN
+            }
+        } catch (throwable: Throwable) {
+            when {
+                throwable is HttpException && throwable.code() == 404 -> TaskServerState.MISSING
+                else -> {
+                    if (!throwable.isExpectedOfflineFailure()) {
+                        accept(throwable)
+                    }
+                    TaskServerState.UNKNOWN
+                }
+            }
+        }
+    }
+
     override suspend fun postTaskDirection(
         id: String,
         direction: String,
@@ -674,9 +705,10 @@ class ApiClientImpl(
 
     override suspend fun postTaskNewPosition(
         id: String,
-        position: Int
+        position: Int,
+        suppressConnectionErrors: Boolean,
     ): List<String>? {
-        return process { apiService.postTaskNewPosition(id, position) }
+        return process(suppressConnectionErrors) { apiService.postTaskNewPosition(id, position) }
     }
 
     override suspend fun postGroupTaskNewPosition(
@@ -718,8 +750,11 @@ class ApiClientImpl(
         return process { apiService.updateTask(id, item) }
     }
 
-    override suspend fun deleteTask(id: String): Boolean {
-        return processWithIfSuccess { apiService.deleteTask(id) }
+    override suspend fun deleteTask(
+        id: String,
+        suppressConnectionErrors: Boolean,
+    ): Boolean {
+        return processWithIfSuccess(suppressConnectionErrors) { apiService.deleteTask(id) }
     }
 
     override suspend fun createTag(tag: Tag): Tag? {

@@ -8,6 +8,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
 import com.google.gson.JsonSerializationContext
 import com.google.gson.JsonSerializer
+import com.habitrpg.android.habitica.data.sync.offlineCreateAlias
 import com.habitrpg.android.habitica.extensions.getAsString
 import com.habitrpg.android.habitica.models.tasks.ChecklistItem
 import com.habitrpg.android.habitica.models.tasks.Days
@@ -64,6 +65,7 @@ class TaskSerializer : JsonSerializer<Task>, JsonDeserializer<Task> {
         val obj = json as? JsonObject ?: return task
         task.text = obj.getAsString("text")
         task.notes = obj.getAsString("notes")
+        task.alias = obj.getAsString("alias").takeIf { it.isNotBlank() }
         task.ownerID = obj.getAsString("userId")
         task.value = obj.get("value")?.asDouble ?: 0.0
         task.type = TaskType.from(obj.getAsString("type")) ?: TaskType.HABIT
@@ -161,6 +163,9 @@ class TaskSerializer : JsonSerializer<Task>, JsonDeserializer<Task> {
     ): JsonElement {
         val obj = JsonObject()
         obj.addProperty("_id", task.id)
+        if (task.pendingCreate) {
+            obj.addProperty("alias", task.offlineCreateAlias())
+        }
         obj.addProperty("text", task.text)
         obj.addProperty("notes", task.notes)
         obj.addProperty("value", task.value)
@@ -211,7 +216,10 @@ class TaskSerializer : JsonSerializer<Task>, JsonDeserializer<Task> {
                 if (task.reminders != null) {
                     obj.add("reminders", serializeReminders(task.reminders))
                 }
-                obj.addProperty("completed", task.completed)
+                obj.addProperty(
+                    "completed",
+                    task.completed && !(task.pendingCreate && task.pendingScoreUp),
+                )
             }
 
             else -> {

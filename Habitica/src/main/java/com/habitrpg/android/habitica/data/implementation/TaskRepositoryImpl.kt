@@ -3,11 +3,13 @@ package com.habitrpg.android.habitica.data.implementation
 import android.util.Log
 import com.habitrpg.android.habitica.data.ApiClient
 import com.habitrpg.android.habitica.data.TaskRepository
+import com.habitrpg.android.habitica.data.TaskServerState
 import com.habitrpg.android.habitica.data.local.TaskLocalRepository
 import com.habitrpg.android.habitica.data.sync.OfflineTaskSyncScheduler
 import com.habitrpg.android.habitica.data.sync.canQueueOfflineTodoCompletion
 import com.habitrpg.android.habitica.data.sync.canQueueOfflineCreation
 import com.habitrpg.android.habitica.data.sync.isQueuedOfflineTodoCompletion
+import com.habitrpg.android.habitica.data.sync.offlineCreateAlias
 import com.habitrpg.android.habitica.helpers.Analytics
 import com.habitrpg.android.habitica.helpers.AppConfigManager
 import com.habitrpg.android.habitica.helpers.EventCategory
@@ -44,7 +46,12 @@ import java.util.UUID
 import kotlin.time.Duration.Companion.seconds
 
 private val offlineTaskSyncMutex = Mutex()
+private val recentTaskIDReplacements = mutableMapOf<String, String>()
 private const val OFFLINE_TASK_SYNC_LOG_TAG = "OfflineTaskSync"
+
+internal fun clearTaskIDReplacements() {
+    recentTaskIDReplacements.clear()
+}
 
 @ExperimentalCoroutinesApi
 class TaskRepositoryImpl(
@@ -123,7 +130,32 @@ class TaskRepositoryImpl(
         force: Boolean,
         notifyFunc: ((TaskScoringResult) -> Unit)?
     ): TaskScoringResult? {
+        return if (force) {
+            taskCheckedInternal(user, task, up, force, notifyFunc)
+        } else {
+            offlineTaskSyncMutex.withLock {
+                taskCheckedInternal(
+                    user,
+                    getLatestLocalTask(task),
+                    up,
+                    force,
+                    notifyFunc,
+                )
+            }
+        }
+    }
+
+    @Suppress("ReturnCount")
+    private suspend fun taskCheckedInternal(
+        user: User?,
+        task: Task,
+        up: Boolean,
+        force: Boolean,
+        notifyFunc: ((TaskScoringResult) -> Unit)?,
+    ): TaskScoringResult? {
+        if (task.pendingDelete) return null
         val canQueueTodoCompletion = task.canQueueOfflineTodoCompletion(up)
+        val isQueuedTaskCreation = task.pendingCreate && task.canQueueOfflineCreation()
         val wasQueuedTodoCompletion = task.isQueuedOfflineTodoCompletion()
         val localData =
             if (user != null && appConfigManager.enableLocalTaskScoring()) {
@@ -142,6 +174,15 @@ class TaskRepositoryImpl(
 
             handleTaskResponse(user, localData, task, up, 0f)
         }
+        if (isQueuedTaskCreation && task.type == TaskType.TODO) {
+            queueTaskOperation(
+                task,
+                pendingCompletion = up,
+                pendingReorder = task.pendingPosition,
+                requiresCreation = true,
+            )
+            return null
+        }
         val now = Date().time
         val id = task.id
         if (lastTaskAction > now - 500 && !force || id == null) {
@@ -157,7 +198,12 @@ class TaskRepositoryImpl(
             )
         if (res == null) {
             if (canQueueTodoCompletion) {
-                queueOfflineTodoCompletion(task, schedule = !wasQueuedTodoCompletion)
+                queueTaskOperation(
+                    task,
+                    pendingCompletion = true,
+                    pendingReorder = false,
+                    requiresCreation = false,
+                )
             }
             return null
         }
@@ -192,23 +238,33 @@ class TaskRepositoryImpl(
         return result
     }
 
-    private fun queueOfflineTodoCompletion(
+    private fun queueTaskOperation(
         task: Task,
-        schedule: Boolean,
-    ) {
+        pendingCompletion: Boolean? = null,
+        pendingReorder: Boolean = false,
+        newPosition: Int? = null,
+        requiresCreation: Boolean = task.pendingCreate,
+    ): Task {
         val pendingTask = localRepository.getUnmanagedCopy(task)
-        pendingTask.completeForUser(currentUserID, true)
-        pendingTask.hasErrored = true
-        pendingTask.isSaving = true
-        localRepository.save(pendingTask)
-        if (schedule) {
-            offlineTaskSyncScheduler.enqueue()
+        pendingTask.pendingCreate = requiresCreation
+        if (pendingReorder) {
+            pendingTask.pendingPosition = true
         }
+        newPosition?.let { pendingTask.position = it }
+        if (pendingCompletion != null && pendingTask.type == TaskType.TODO) {
+            pendingTask.completeForUser(currentUserID, pendingCompletion)
+            pendingTask.pendingScoreUp = pendingCompletion
+        }
+        localRepository.save(pendingTask)
+        offlineTaskSyncScheduler.enqueue()
+        Log.i(OFFLINE_TASK_SYNC_LOG_TAG, "Queued one local task operation for server sync.")
+        return pendingTask
     }
 
-    private fun clearQueuedTodoCompletion(task: Task) {
-        val completedTask = localRepository.getUnmanagedCopy(task)
+    private suspend fun clearQueuedTodoCompletion(task: Task) {
+        val completedTask = getLatestLocalTask(task)
         completedTask.completeForUser(currentUserID, true)
+        completedTask.pendingScoreUp = false
         completedTask.hasErrored = false
         completedTask.isSaving = false
         localRepository.save(completedTask)
@@ -261,22 +317,26 @@ class TaskRepositoryImpl(
 
             val taskId = bgTask.id
             if (taskId != null) {
-                it.where(Task::class.java).equalTo("id", taskId).findAll().forEach { sibling ->
-                    if (sibling.ownerID != bgTask.ownerID) {
-                        sibling.value = bgTask.value
-                        sibling.streak = bgTask.streak
-                        sibling.completed = bgTask.completed
-                        sibling.counterUp = bgTask.counterUp
-                        sibling.counterDown = bgTask.counterDown
-                        if (sibling.isGroupTask) {
-                            sibling.group?.assignedUsersDetail
-                                ?.firstOrNull { detail -> detail.assignedUserID == user.id }
-                                ?.let { detail ->
-                                    detail.completed = up
-                                    detail.completedDate = if (up) Date() else null
-                                }
+                try {
+                    it.where(Task::class.java).equalTo("id", taskId).findAll().forEach { sibling ->
+                        if (sibling.ownerID != bgTask.ownerID) {
+                            sibling.value = bgTask.value
+                            sibling.streak = bgTask.streak
+                            sibling.completed = bgTask.completed
+                            sibling.counterUp = bgTask.counterUp
+                            sibling.counterDown = bgTask.counterDown
+                            if (sibling.isGroupTask) {
+                                sibling.group?.assignedUsersDetail
+                                    ?.firstOrNull { detail -> detail.assignedUserID == user.id }
+                                    ?.let { detail ->
+                                        detail.completed = up
+                                        detail.completedDate = if (up) Date() else null
+                                    }
+                            }
                         }
                     }
+                } catch (_: IllegalStateException) {
+                    // The Realm can be closed while a local scoring callback is finishing.
                 }
             }
             res._tmp?.drop?.key?.let { key ->
@@ -340,13 +400,43 @@ class TaskRepositoryImpl(
         force: Boolean,
         notifyFunc: ((TaskScoringResult) -> Unit)?
     ): TaskScoringResult? {
-        val task = localRepository.getTask(taskId).firstOrNull() ?: return null
-        return taskChecked(user, task, up, force, notifyFunc)
+        return if (force) {
+            taskCheckedByIDInternal(user, taskId, up, force, notifyFunc)
+        } else {
+            offlineTaskSyncMutex.withLock {
+                taskCheckedByIDInternal(user, taskId, up, force, notifyFunc)
+            }
+        }
+    }
+
+    private suspend fun taskCheckedByIDInternal(
+        user: User?,
+        taskId: String,
+        up: Boolean,
+        force: Boolean,
+        notifyFunc: ((TaskScoringResult) -> Unit)?,
+    ): TaskScoringResult? {
+        val task = localRepository.getTask(resolveTaskID(taskId)).firstOrNull() ?: return null
+        return taskCheckedInternal(user, task, up, force, notifyFunc)
     }
 
     override suspend fun scoreChecklistItem(
         taskId: String,
         itemId: String
+    ): Task? {
+        return offlineTaskSyncMutex.withLock {
+            val resolvedTaskID = resolveTaskID(taskId)
+            val localTask = localRepository.getTaskCopy(resolvedTaskID).firstOrNull()
+            if (localTask?.pendingCreate == true || localTask?.pendingDelete == true) {
+                return@withLock null
+            }
+            scoreChecklistItemInternal(resolvedTaskID, itemId)
+        }
+    }
+
+    private suspend fun scoreChecklistItemInternal(
+        taskId: String,
+        itemId: String,
     ): Task? {
         val task = apiClient.scoreChecklistItem(taskId, itemId)
         val updatedItem: ChecklistItem? = task?.checklist?.lastOrNull { itemId == it.id }
@@ -356,13 +446,24 @@ class TaskRepositoryImpl(
         return task
     }
 
-    override fun getTask(taskId: String) = localRepository.getTask(taskId)
+    override fun getTask(taskId: String) = localRepository.getTask(resolveTaskID(taskId))
 
-    override fun getTaskCopy(taskId: String) = localRepository.getTaskCopy(taskId)
+    override fun getTaskCopy(taskId: String) = localRepository.getTaskCopy(resolveTaskID(taskId))
 
     override suspend fun createTask(
         task: Task,
         force: Boolean
+    ): Task? {
+        return if (force) {
+            createTaskInternal(task, force)
+        } else {
+            offlineTaskSyncMutex.withLock { createTaskInternal(task, force) }
+        }
+    }
+
+    private suspend fun createTaskInternal(
+        task: Task,
+        force: Boolean,
     ): Task? {
         val now = Date().time
         if (lastTaskAction > now - 500 && !force) {
@@ -374,6 +475,9 @@ class TaskRepositoryImpl(
         task.isSaving = true
         task.isCreating = true
         task.hasErrored = false
+        task.pendingCreate = canQueue
+        task.pendingPosition = false
+        task.pendingScoreUp = false
         task.ownerID =
             if (task.isGroupTask) {
                 task.group?.groupID ?: ""
@@ -383,6 +487,9 @@ class TaskRepositoryImpl(
         if (task.id == null) {
             task.id = UUID.randomUUID().toString()
         }
+        if (task.pendingCreate) {
+            task.alias = task.offlineCreateAlias()
+        }
         localRepository.save(task)
 
         val savedTask =
@@ -391,12 +498,22 @@ class TaskRepositoryImpl(
             } else {
                 apiClient.createTask(task, suppressConnectionErrors = canQueue)
             }
+        val latestLocalTask =
+            task.id?.let { localRepository.getTaskCopy(it).firstOrNull() } ?: task
         if (savedTask != null) {
-            saveCreatedTask(task, savedTask)
+            saveCreatedTask(
+                latestLocalTask,
+                savedTask,
+                preservePendingActions = true,
+            )
         } else {
-            task.hasErrored = !canQueue
-            task.isSaving = false
-            localRepository.save(task)
+            latestLocalTask.hasErrored = !canQueue
+            latestLocalTask.isSaving = false
+            latestLocalTask.pendingCreate = canQueue
+            if (canQueue && !latestLocalTask.pendingDelete) {
+                latestLocalTask.pendingPosition = true
+            }
+            localRepository.save(latestLocalTask)
             if (canQueue) {
                 offlineTaskSyncScheduler.enqueue()
             }
@@ -407,20 +524,37 @@ class TaskRepositoryImpl(
     private fun saveCreatedTask(
         localTask: Task,
         savedTask: Task,
+        preservePendingActions: Boolean = false,
     ) {
         val localTaskID = localTask.id
-        if (savedTask.id != localTaskID && localTaskID != null) {
-            localRepository.deleteTask(localTaskID)
-        }
+        val shouldReplaceLocalTask = savedTask.id != localTaskID && localTaskID != null
         if (savedTask.ownerID.isBlank()) {
             savedTask.ownerID = localTask.ownerID
         }
         savedTask.dateCreated = savedTask.dateCreated ?: Date()
+        savedTask.position = localTask.position
         savedTask.tags = localTask.tags
         savedTask.isCreating = false
         savedTask.isSaving = false
         savedTask.hasErrored = false
-        localRepository.save(savedTask)
+        savedTask.pendingCreate = false
+        savedTask.pendingDelete = preservePendingActions && localTask.pendingDelete
+        savedTask.pendingPosition = preservePendingActions && localTask.pendingPosition
+        savedTask.pendingScoreUp = preservePendingActions && localTask.pendingScoreUp
+        if (savedTask.pendingScoreUp && localTask.type == TaskType.TODO && localTask.completed) {
+            savedTask.completeForUser(currentUserID, true)
+        }
+        if (shouldReplaceLocalTask && localTaskID != null) {
+            savedTask.id?.let { replacementTaskID ->
+                recentTaskIDReplacements.entries
+                    .filter { it.value == localTaskID }
+                    .forEach { it.setValue(replacementTaskID) }
+                recentTaskIDReplacements[localTaskID] = replacementTaskID
+            }
+            localRepository.replaceTask(localTaskID, savedTask)
+        } else {
+            localRepository.save(savedTask)
+        }
     }
 
     @Suppress("ReturnCount")
@@ -428,9 +562,31 @@ class TaskRepositoryImpl(
         task: Task,
         force: Boolean
     ): Task? {
+        return if (force) {
+            updateTaskInternal(task, force)
+        } else {
+            offlineTaskSyncMutex.withLock {
+                updateTaskInternal(getLatestLocalTask(task), force)
+            }
+        }
+    }
+
+    private suspend fun updateTaskInternal(
+        task: Task,
+        force: Boolean,
+    ): Task? {
         val now = Date().time
         if ((lastTaskAction > now - 500 && !force) || !task.isValid) {
             return task
+        }
+        if (task.pendingDelete) return task
+        if (task.pendingCreate && task.canQueueOfflineCreation()) {
+            val pendingTask = localRepository.getUnmanagedCopy(task)
+            pendingTask.isSaving = false
+            pendingTask.hasErrored = false
+            localRepository.save(pendingTask)
+            offlineTaskSyncScheduler.enqueue()
+            return pendingTask
         }
         lastTaskAction = now
         val id = task.id ?: return task
@@ -439,29 +595,47 @@ class TaskRepositoryImpl(
         unmanagedTask.hasErrored = false
         localRepository.save(unmanagedTask)
         val savedTask = apiClient.updateTask(id, unmanagedTask)
-        savedTask?.position = task.position
-        savedTask?.id = task.id
-        savedTask?.ownerID = task.ownerID
+        val latestLocalTask = localRepository.getTaskCopy(id).firstOrNull() ?: unmanagedTask
+        savedTask?.position = latestLocalTask.position
+        savedTask?.id = latestLocalTask.id
+        savedTask?.ownerID = latestLocalTask.ownerID
         if (savedTask != null) {
-            savedTask.tags = task.tags
+            savedTask.tags = latestLocalTask.tags
+            savedTask.pendingCreate = latestLocalTask.pendingCreate
+            savedTask.pendingDelete = latestLocalTask.pendingDelete
+            savedTask.pendingPosition = latestLocalTask.pendingPosition
+            savedTask.pendingScoreUp = latestLocalTask.pendingScoreUp
+            if (savedTask.pendingScoreUp && latestLocalTask.completed) {
+                savedTask.completeForUser(currentUserID, true)
+            }
             localRepository.save(savedTask)
         } else {
-            unmanagedTask.hasErrored = true
-            unmanagedTask.isSaving = false
-            localRepository.save(unmanagedTask)
+            latestLocalTask.hasErrored = true
+            latestLocalTask.isSaving = false
+            localRepository.save(latestLocalTask)
         }
         return savedTask
     }
 
     override suspend fun deleteTask(taskId: String): Boolean {
-        val localTask = localRepository.getTaskCopy(taskId).firstOrNull()
-        if (localTask?.isCreating == true && localTask.canQueueOfflineCreation()) {
-            localRepository.deleteTask(taskId)
-            Log.i(OFFLINE_TASK_SYNC_LOG_TAG, "Canceled one queued task creation locally.")
+        return offlineTaskSyncMutex.withLock { deleteTaskInternal(taskId) }
+    }
+
+    private suspend fun deleteTaskInternal(taskId: String): Boolean {
+        val resolvedTaskID = resolveTaskID(taskId)
+        val localTask = localRepository.getTaskCopy(resolvedTaskID).firstOrNull()
+        if (localTask?.canQueueOfflineCreation() == true) {
+            val pendingDelete = localRepository.getUnmanagedCopy(localTask)
+            pendingDelete.pendingDelete = true
+            pendingDelete.pendingPosition = false
+            pendingDelete.pendingScoreUp = false
+            localRepository.save(pendingDelete)
+            offlineTaskSyncScheduler.enqueue()
+            Log.i(OFFLINE_TASK_SYNC_LOG_TAG, "Queued one local task deletion for server sync.")
             return true
         }
-        if (!apiClient.deleteTask(taskId)) return false
-        localRepository.deleteTask(taskId)
+        if (!apiClient.deleteTask(resolvedTaskID)) return false
+        localRepository.deleteTask(resolvedTaskID)
         return true
     }
 
@@ -497,12 +671,50 @@ class TaskRepositoryImpl(
         taskID: String,
         newPosition: Int
     ): List<String>? {
-        val task = getTask(taskID).firstOrNull()
+        return offlineTaskSyncMutex.withLock {
+            updateTaskPositionInternal(taskType, taskID, newPosition)
+        }
+    }
+
+    private suspend fun updateTaskPositionInternal(
+        taskType: TaskType,
+        taskID: String,
+        newPosition: Int,
+    ): List<String>? {
+        val resolvedTaskID = resolveTaskID(taskID)
+        val task = getTask(resolvedTaskID).firstOrNull()
+        if (task?.pendingDelete == true) return emptyList()
+        val canQueue = task?.canQueueOfflineCreation() == true
+        if (task?.pendingCreate == true && canQueue) {
+            queueTaskOperation(
+                task,
+                pendingReorder = true,
+                newPosition = newPosition,
+                requiresCreation = true,
+            )
+            return emptyList()
+        }
         val positions = if (task?.isGroupTask == true) {
-            apiClient.postGroupTaskNewPosition(taskID, newPosition)
+            apiClient.postGroupTaskNewPosition(resolvedTaskID, newPosition)
         } else {
-            apiClient.postTaskNewPosition(taskID, newPosition)
-        } ?: return null
+            apiClient.postTaskNewPosition(
+                resolvedTaskID,
+                newPosition,
+                suppressConnectionErrors = canQueue,
+            )
+        }
+        if (positions == null) {
+            if (canQueue && task != null) {
+                queueTaskOperation(
+                    task,
+                    pendingReorder = true,
+                    newPosition = newPosition,
+                    requiresCreation = false,
+                )
+                return emptyList()
+            }
+            return null
+        }
         localRepository.updateTaskPositions(positions)
         return positions
     }
@@ -588,16 +800,19 @@ class TaskRepositoryImpl(
         return offlineTaskSyncMutex.withLock {
             val tasks = localRepository.getErroredTasks(currentUserID).firstOrNull()
                 ?: return@withLock null
-            val unmanagedTasks = tasks.map { localRepository.getUnmanagedCopy(it) }
+            val unmanagedTasks =
+                tasks.map { localRepository.getUnmanagedCopy(it) }
+                    .filterNot { it.pendingDelete }
             val (queuedCreations, nonCreationTasks) =
-                unmanagedTasks.partition { task -> task.isCreating && task.canQueueOfflineCreation() }
-            val (queuedTodoCompletions, otherTasks) =
-                nonCreationTasks.partition { task -> task.isQueuedOfflineTodoCompletion() }
-            val todoCompletionResults = syncQueuedTodoCompletions(queuedTodoCompletions)
+                unmanagedTasks.partition { task ->
+                    task.pendingCreate && task.canQueueOfflineCreation()
+                }
+            val (queuedActions, otherTasks) =
+                nonCreationTasks.partition { task ->
+                    (task.pendingPosition || task.pendingScoreUp) && task.canQueueOfflineCreation()
+                }
             syncQueuedTaskCreations(queuedCreations).filterNotNull() +
-                queuedTodoCompletions.zip(todoCompletionResults).mapNotNull { (task, synced) ->
-                    task.takeIf { synced }
-                } +
+                syncQueuedTaskActions(queuedActions).filterNotNull() +
                 otherTasks.mapNotNull { task ->
                     if (task.isCreating) {
                         createTask(task, true)
@@ -615,61 +830,232 @@ class TaskRepositoryImpl(
             val queuedTasks =
                 tasks.map { localRepository.getUnmanagedCopy(it) }
                     .filter { task -> task.canQueueOfflineCreation() }
-            val pendingTodoCompletions =
-                localRepository.getPendingTodoCompletions(currentUserID).firstOrNull().orEmpty()
+            val pendingDeletions =
+                localRepository.getPendingTaskDeletions(currentUserID).firstOrNull().orEmpty()
                     .map { localRepository.getUnmanagedCopy(it) }
-                    .filter { task -> task.isQueuedOfflineTodoCompletion() }
+                    .filter { task -> task.canQueueOfflineCreation() }
+            val pendingActions =
+                localRepository.getPendingTaskActions(currentUserID).firstOrNull().orEmpty()
+                    .map { localRepository.getUnmanagedCopy(it) }
+                    .filter { task -> task.canQueueOfflineCreation() }
             Log.i(
                 OFFLINE_TASK_SYNC_LOG_TAG,
-                "Syncing ${queuedTasks.size} queued creations and " +
-                    "${pendingTodoCompletions.size} queued completions."
+                "Syncing ${queuedTasks.size} queued creations, " +
+                    "${pendingDeletions.size} queued deletions, and " +
+                    "${pendingActions.size} queued actions."
             )
+            val deletionsSynced = syncQueuedTaskDeletions(pendingDeletions).all { it }
             val creationsSynced = syncQueuedTaskCreations(queuedTasks).all { task -> task != null }
-            val completionsSynced = syncQueuedTodoCompletions(pendingTodoCompletions).all { it }
+            val actionsSynced = syncQueuedTaskActions(pendingActions).all { task -> task != null }
             Log.i(
                 OFFLINE_TASK_SYNC_LOG_TAG,
-                "Queued sync finished: creations=$creationsSynced, completions=$completionsSynced."
+                "Queued sync finished: creations=$creationsSynced, " +
+                    "deletions=$deletionsSynced, actions=$actionsSynced."
             )
-            creationsSynced && completionsSynced
+            deletionsSynced && creationsSynced && actionsSynced
+        }
+    }
+
+    private suspend fun syncQueuedTaskDeletions(tasks: List<Task>): List<Boolean> {
+        return tasks.map { task ->
+            val localTaskID = task.id ?: return@map false
+            val taskIdentifier =
+                if (task.pendingCreate) task.offlineCreateAlias() ?: localTaskID else localTaskID
+            val serverTaskID =
+                if (task.pendingCreate) {
+                    apiClient.getTask(taskIdentifier, suppressConnectionErrors = true)?.id
+                } else {
+                    localTaskID
+                }
+            var deleted = apiClient.deleteTask(taskIdentifier, suppressConnectionErrors = true)
+            var serverMissing = false
+            if (!deleted) {
+                serverMissing =
+                    apiClient.getTaskServerState(taskIdentifier) == TaskServerState.MISSING
+            }
+            if (!deleted && serverMissing && task.pendingCreate && taskIdentifier != localTaskID) {
+                deleted = apiClient.deleteTask(localTaskID, suppressConnectionErrors = true)
+                serverMissing =
+                    !deleted &&
+                    apiClient.getTaskServerState(localTaskID) == TaskServerState.MISSING
+            }
+            if (deleted || serverMissing) {
+                localRepository.deleteTask(localTaskID)
+                if (serverTaskID != null && serverTaskID != localTaskID) {
+                    localRepository.deleteTask(serverTaskID)
+                }
+                true
+            } else {
+                false
+            }
         }
     }
 
     private suspend fun syncQueuedTaskCreations(tasks: List<Task>): List<Task?> {
         if (tasks.isEmpty()) return emptyList()
-        val onlineTasksByID =
-            apiClient.getTasks(suppressConnectionErrors = true)?.tasks?.values
-                ?.mapNotNull { task -> task.id?.let { taskID -> taskID to task } }
-                ?.toMap()
-                .orEmpty()
         return tasks.map { task ->
-            val onlineTask = task.id?.let(onlineTasksByID::get)
-            if (onlineTask != null) {
-                saveCreatedTask(task, onlineTask)
-                onlineTask
+            val taskID = task.id ?: return@map null
+            val taskIdentifier = task.offlineCreateAlias() ?: taskID
+            val onlineTask =
+                apiClient.getTask(taskIdentifier, suppressConnectionErrors = true)
+                    ?: apiClient.getTask(taskID, suppressConnectionErrors = true)
+            var serverAlreadyCompleted = false
+            val syncedTask =
+                if (onlineTask != null) {
+                    serverAlreadyCompleted = onlineTask.completed
+                    val latestLocalTask = getLatestLocalTask(task)
+                    saveCreatedTask(latestLocalTask, onlineTask, preservePendingActions = true)
+                    onlineTask
+                } else {
+                    val aliasState = apiClient.getTaskServerState(taskIdentifier)
+                    val originalIDState = apiClient.getTaskServerState(taskID)
+                    if (aliasState != TaskServerState.MISSING ||
+                        originalIDState != TaskServerState.MISSING
+                    ) {
+                        return@map null
+                    }
+                    val latestLocalTask = getLatestLocalTask(task)
+                    if (latestLocalTask.pendingDelete) return@map latestLocalTask
+                    val createdTask =
+                        apiClient.createTask(latestLocalTask, suppressConnectionErrors = true)
+                    serverAlreadyCompleted = createdTask?.completed == true
+                    createdTask?.also {
+                        val currentLocalTask = getLatestLocalTask(latestLocalTask)
+                        saveCreatedTask(currentLocalTask, it, preservePendingActions = true)
+                    }
+                }
+            if (syncedTask == null) {
+                syncedTask
+            } else if (syncedTask.pendingDelete) {
+                syncedTask
             } else {
-                createTask(task, true)
+                replayQueuedTaskActions(
+                    syncedTask,
+                    syncedTask.position,
+                    shouldReorder = syncedTask.pendingPosition,
+                    shouldComplete = syncedTask.pendingScoreUp && !serverAlreadyCompleted,
+                )
             }
         }
     }
 
-    private suspend fun syncQueuedTodoCompletions(tasks: List<Task>): List<Boolean> {
+    private suspend fun getLatestLocalTask(task: Task): Task {
+        val taskID = task.id ?: return task
+        return localRepository.getTaskCopy(resolveTaskID(taskID)).firstOrNull() ?: task
+    }
+
+    private fun resolveTaskID(taskID: String): String {
+        recentTaskIDReplacements[taskID]?.let { cachedTaskID ->
+            val resolvedCachedTaskID =
+                localRepository.resolveTaskID(cachedTaskID, offlineCreateAlias(taskID))
+            recentTaskIDReplacements[taskID] = resolvedCachedTaskID
+            return resolvedCachedTaskID
+        }
+        val resolvedTaskID =
+            localRepository.resolveTaskID(taskID, offlineCreateAlias(taskID))
+        if (resolvedTaskID != taskID) {
+            recentTaskIDReplacements[taskID] = resolvedTaskID
+        }
+        return resolvedTaskID
+    }
+
+    private suspend fun syncQueuedTaskActions(tasks: List<Task>): List<Task?> {
         return tasks.map { task ->
-            val taskID = task.id ?: return@map false
-            val onlineTask =
-                apiClient.getTask(taskID, suppressConnectionErrors = true) ?: return@map false
-            if (onlineTask.completed) {
-                if (onlineTask.ownerID.isBlank()) {
-                    onlineTask.ownerID = task.ownerID
-                }
-                onlineTask.position = task.position
-                onlineTask.tags = task.tags
-                onlineTask.hasErrored = false
-                onlineTask.isSaving = false
-                localRepository.save(onlineTask)
-                true
+            val taskID = task.id ?: return@map null
+            val onlineTask = apiClient.getTask(taskID, suppressConnectionErrors = true)
+            if (onlineTask != null) {
+                val latestLocalTask = getLatestLocalTask(task)
+                if (latestLocalTask.pendingDelete) return@map latestLocalTask
+                val shouldComplete =
+                    latestLocalTask.pendingScoreUp &&
+                        latestLocalTask.type == TaskType.TODO &&
+                        latestLocalTask.completed &&
+                        !onlineTask.completed
+                val shouldReorder = latestLocalTask.pendingPosition
+                saveCreatedTask(latestLocalTask, onlineTask, preservePendingActions = true)
+                replayQueuedTaskActions(
+                    onlineTask,
+                    latestLocalTask.position,
+                    shouldReorder,
+                    shouldComplete,
+                )
             } else {
-                taskChecked(null, task, true, true, null) != null
+                when (apiClient.getTaskServerState(taskID)) {
+                    TaskServerState.MISSING -> {
+                        val latestLocalTask = getLatestLocalTask(task)
+                        if (latestLocalTask.pendingDelete) return@map latestLocalTask
+                        val queuedCreation =
+                            queueTaskOperation(
+                                latestLocalTask,
+                                pendingCompletion =
+                                    true.takeIf {
+                                        latestLocalTask.pendingScoreUp &&
+                                            latestLocalTask.type == TaskType.TODO
+                                    },
+                                pendingReorder = latestLocalTask.pendingPosition,
+                                requiresCreation = true,
+                            )
+                        syncQueuedTaskCreations(listOf(queuedCreation)).firstOrNull()
+                    }
+                    TaskServerState.PRESENT,
+                    TaskServerState.UNKNOWN -> null
+                }
             }
+        }
+    }
+
+    private suspend fun replayQueuedTaskActions(
+        syncedTask: Task,
+        desiredPosition: Int,
+        shouldReorder: Boolean,
+        shouldComplete: Boolean,
+    ): Task? {
+        val taskID = syncedTask.id ?: return null
+        val pendingTask = localRepository.getUnmanagedCopy(syncedTask)
+        pendingTask.position = desiredPosition
+        pendingTask.pendingCreate = false
+        pendingTask.pendingPosition = shouldReorder
+        pendingTask.pendingScoreUp = shouldComplete
+        if (shouldComplete && pendingTask.type == TaskType.TODO) {
+            pendingTask.completeForUser(currentUserID, true)
+        }
+        localRepository.save(pendingTask)
+
+        if (shouldReorder) {
+            val positions =
+                apiClient.postTaskNewPosition(
+                    taskID,
+                    desiredPosition,
+                    suppressConnectionErrors = true,
+                ) ?: return null
+            val currentTask = getLatestLocalTask(pendingTask)
+            if (currentTask.pendingDelete) return currentTask
+            if (currentTask.pendingPosition && currentTask.position != desiredPosition) {
+                return null
+            }
+            localRepository.updateTaskPositions(positions)
+            currentTask.pendingPosition = false
+            localRepository.save(currentTask)
+        }
+
+        var currentTask = getLatestLocalTask(pendingTask)
+        if (currentTask.pendingDelete) return currentTask
+
+        if (currentTask.pendingScoreUp &&
+            currentTask.type == TaskType.TODO &&
+            currentTask.completed
+        ) {
+            if (taskChecked(null, currentTask, true, true, null) == null) return null
+            currentTask = getLatestLocalTask(currentTask)
+        }
+
+        return if (currentTask.pendingDelete ||
+            currentTask.pendingPosition ||
+            currentTask.pendingScoreUp
+        ) {
+            null
+        } else {
+            currentTask
         }
     }
 

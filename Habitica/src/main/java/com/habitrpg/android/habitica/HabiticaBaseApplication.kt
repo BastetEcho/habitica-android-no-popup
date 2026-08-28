@@ -27,6 +27,7 @@ import com.google.firebase.remoteconfig.FirebaseRemoteConfig
 import com.google.firebase.remoteconfig.FirebaseRemoteConfigException
 import com.google.firebase.remoteconfig.FirebaseRemoteConfigSettings
 import com.habitrpg.android.habitica.data.ApiClient
+import com.habitrpg.android.habitica.data.local.HabiticaRealmMigration
 import com.habitrpg.android.habitica.extensions.DateUtils
 import com.habitrpg.android.habitica.helpers.AdHandler
 import com.habitrpg.android.habitica.helpers.Analytics
@@ -246,8 +247,8 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
         Realm.init(this)
         val builder =
             RealmConfiguration.Builder()
-                .schemaVersion(1)
-                .deleteRealmIfMigrationNeeded()
+                .schemaVersion(HabiticaRealmMigration.OUTBOX_SCHEMA_VERSION)
+                .migration(HabiticaRealmMigration())
                 .allowWritesOnUiThread(true)
                 .compactOnLaunch { totalBytes, usedBytes ->
                     // Compact if the file is over 100MB in size and less than 50% 'used'

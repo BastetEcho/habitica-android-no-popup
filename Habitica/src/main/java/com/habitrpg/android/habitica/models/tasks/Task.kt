@@ -45,6 +45,7 @@ open class Task : RealmObject, BaseMainObject, Parcelable, BaseTask {
             field = value
             combinedID = id + ownerID
         }
+    var alias: String? = null
     var ownerID: String = ""
         set(value) {
             field = value
@@ -122,6 +123,10 @@ open class Task : RealmObject, BaseMainObject, Parcelable, BaseTask {
     var isSaving: Boolean = false
     var hasErrored: Boolean = false
     var isCreating: Boolean = false
+    var pendingCreate: Boolean = false
+    var pendingDelete: Boolean = false
+    var pendingPosition: Boolean = false
+    var pendingScoreUp: Boolean = false
     var yesterDaily: Boolean = true
 
     var daysOfMonthString: String? = null

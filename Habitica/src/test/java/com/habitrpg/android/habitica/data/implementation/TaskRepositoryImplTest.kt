@@ -26,6 +26,7 @@ import io.mockk.slot
 import io.mockk.spyk
 import io.mockk.verify
 import io.realm.Realm
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
 import java.util.UUID
 import kotlin.time.Duration.Companion.milliseconds
@@ -58,6 +59,8 @@ class TaskRepositoryImplTest : WordSpec({
         every { localRepository.getLiveObject(capture(liveObjectSlot)) } answers {
             liveObjectSlot.captured
         }
+        every { localRepository.resolveTaskID(any(), any()) } answers { firstArg() }
+        every { localRepository.getTaskCopy(any()) } returns emptyFlow()
     }
     "retrieveTasks" should {
         "save tasks locally" {
@@ -101,7 +104,7 @@ class TaskRepositoryImplTest : WordSpec({
             user.stats?.hp = 8.0
             user.stats?.mp = 4.0
             coEvery { apiClient.postTaskDirection(any(), "up") } returns data
-            val result = repository.taskChecked(user, task, true, false, null)
+            val result = repository.taskChecked(user, task, true, true, null)
             result?.level shouldBe 10
             result?.healthDelta shouldBe 12.0
             result?.manaDelta shouldBe 26.0
@@ -112,7 +115,7 @@ class TaskRepositoryImplTest : WordSpec({
             data.lvl = 11
             user.stats?.lvl = 10
             coEvery { apiClient.postTaskDirection(any(), "up") } returns data
-            val result = repository.taskChecked(user, task, true, false, null)
+            val result = repository.taskChecked(user, task, true, true, null)
             result?.level shouldBe 11
             result?.hasLeveledUp shouldBe true
         }
@@ -121,7 +124,7 @@ class TaskRepositoryImplTest : WordSpec({
             data.lvl = 1
             user.stats = null
             coEvery { apiClient.postTaskDirection(any(), "up") } returns data
-            repository.taskChecked(user, task, true, false, null)
+            repository.taskChecked(user, task, true, true, null)
         }
         "update daily streak" {
             val data = TaskDirectionData()
@@ -130,7 +133,7 @@ class TaskRepositoryImplTest : WordSpec({
             task.type = TaskType.DAILY
             task.value = 0.0
             coEvery { apiClient.postTaskDirection(any(), "up") } returns data
-            repository.taskChecked(user, task, true, false, null)
+            repository.taskChecked(user, task, true, true, null)
             task.streak shouldBe 1
             task.completed shouldBe true
         }
@@ -141,7 +144,7 @@ class TaskRepositoryImplTest : WordSpec({
             task.type = TaskType.HABIT
             task.value = 0.0
             coEvery { apiClient.postTaskDirection(any(), "up") } returns data
-            repository.taskChecked(user, task, true, false, null)
+            repository.taskChecked(user, task, true, true, null)
             task.counterUp shouldBe 1
 
             data.delta = -10.0f

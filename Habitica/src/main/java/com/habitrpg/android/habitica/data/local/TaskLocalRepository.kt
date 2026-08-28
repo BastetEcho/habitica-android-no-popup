@@ -24,6 +24,16 @@ interface TaskLocalRepository : BaseLocalRepository {
 
     fun deleteTask(taskID: String)
 
+    fun replaceTask(
+        taskID: String,
+        task: Task,
+    )
+
+    fun resolveTaskID(
+        taskID: String,
+        alias: String,
+    ): String
+
     fun getTask(taskId: String): Flow<Task>
 
     fun getTaskCopy(taskId: String): Flow<Task>
@@ -56,7 +66,9 @@ interface TaskLocalRepository : BaseLocalRepository {
 
     fun getPendingTaskCreations(userID: String): Flow<List<Task>>
 
-    fun getPendingTodoCompletions(userID: String): Flow<List<Task>>
+    fun getPendingTaskDeletions(userID: String): Flow<List<Task>>
+
+    fun getPendingTaskActions(userID: String): Flow<List<Task>>
 
     fun getUser(userID: String): Flow<User>
 

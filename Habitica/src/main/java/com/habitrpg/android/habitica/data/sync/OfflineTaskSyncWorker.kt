@@ -20,6 +20,14 @@ import dagger.hilt.components.SingletonComponent
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 
+private const val OFFLINE_TASK_ALIAS_PREFIX = "android_"
+
+internal fun offlineCreateAlias(taskID: String): String = "$OFFLINE_TASK_ALIAS_PREFIX$taskID"
+
+internal fun Task.offlineCreateAlias(): String? {
+    return alias?.takeIf { it.isNotBlank() } ?: id?.let(::offlineCreateAlias)
+}
+
 internal fun Task.canQueueOfflineCreation(): Boolean {
     return !isGroupTask &&
         challengeID.isNullOrBlank() &&
@@ -31,13 +39,11 @@ internal fun Task.canQueueOfflineTodoCompletion(up: Boolean): Boolean {
         !isGroupTask &&
         challengeID.isNullOrBlank() &&
         type == TaskType.TODO &&
-        !isCreating
+        !pendingCreate
 }
 
 internal fun Task.isQueuedOfflineTodoCompletion(): Boolean {
-    // The otherwise-unused hasErrored + isSaving combination distinguishes a queued score
-    // from an ordinary failed edit without requiring a destructive Realm schema migration.
-    return canQueueOfflineTodoCompletion(true) && completed && hasErrored && isSaving
+    return canQueueOfflineTodoCompletion(true) && completed && pendingScoreUp
 }
 
 class OfflineTaskSyncScheduler
