@@ -39,6 +39,12 @@ import com.habitrpg.shared.habitica.models.responses.VerifyEmailResponse
 import com.habitrpg.shared.habitica.models.responses.VerifyUsernameResponse
 import retrofit2.HttpException
 
+enum class TaskServerState {
+    PRESENT,
+    MISSING,
+    UNKNOWN,
+}
+
 interface ApiClient {
     val hostConfig: HostConfig
 
@@ -46,7 +52,11 @@ interface ApiClient {
 
     // user API
 
-    suspend fun getTasks(): TaskList?
+    suspend fun getTasks(
+        suppressConnectionErrors: Boolean = false,
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
+    ): TaskList?
 
     // challenges api
 
@@ -124,18 +134,35 @@ interface ApiClient {
 
     suspend fun unlockPath(path: String): UnlockResponse?
 
-    suspend fun getTask(id: String): Task?
+    suspend fun getTask(
+        id: String,
+        suppressConnectionErrors: Boolean = false,
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
+    ): Task?
+
+    suspend fun getTaskServerState(
+        id: String,
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
+    ): TaskServerState
 
     suspend fun postTaskDirection(
         id: String,
-        direction: String
+        direction: String,
+        suppressConnectionErrors: Boolean = false,
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
     ): TaskDirectionData?
 
     suspend fun bulkScoreTasks(data: List<Map<String, String>>): BulkTaskScoringData?
 
     suspend fun postTaskNewPosition(
         id: String,
-        position: Int
+        position: Int,
+        suppressConnectionErrors: Boolean = false,
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
     ): List<String>?
 
     suspend fun postGroupTaskNewPosition(
@@ -145,10 +172,18 @@ interface ApiClient {
 
     suspend fun scoreChecklistItem(
         taskId: String,
-        itemId: String
+        itemId: String,
+        suppressConnectionErrors: Boolean = false,
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
     ): Task?
 
-    suspend fun createTask(item: Task): Task?
+    suspend fun createTask(
+        item: Task,
+        suppressConnectionErrors: Boolean = false,
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
+    ): Task?
 
     suspend fun createGroupTask(
         groupId: String,
@@ -159,10 +194,18 @@ interface ApiClient {
 
     suspend fun updateTask(
         id: String,
-        item: Task
+        item: Task,
+        suppressConnectionErrors: Boolean = false,
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
     ): Task?
 
-    suspend fun deleteTask(id: String): Void?
+    suspend fun deleteTask(
+        id: String,
+        suppressConnectionErrors: Boolean = false,
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
+    ): Boolean
 
     suspend fun createTag(tag: Tag): Tag?
 
@@ -391,7 +434,12 @@ interface ApiClient {
 
     fun hasAuthenticationKeys(): Boolean
 
-    suspend fun retrieveUser(withTasks: Boolean = false): User?
+    suspend fun retrieveUser(
+        withTasks: Boolean = false,
+        expectedUserID: String? = null,
+        suppressConnectionErrors: Boolean = false,
+        expectedServerOrigin: String? = null,
+    ): User?
 
     suspend fun retrieveInboxMessages(
         uuid: String,

@@ -52,10 +52,11 @@ class DeviceCommunicationService : WearableListenerService() {
     }
 
     private fun processAuthRequest(event: MessageEvent) {
+        val authentication = hostConfig.authenticationSnapshot()
         messageClient.sendMessage(
             event.sourceNodeId,
             "/auth",
-            "${hostConfig.userID}:${hostConfig.apiKey}".toByteArray()
+            "${authentication.userID}:${authentication.apiKey}".toByteArray()
         )
     }
 }

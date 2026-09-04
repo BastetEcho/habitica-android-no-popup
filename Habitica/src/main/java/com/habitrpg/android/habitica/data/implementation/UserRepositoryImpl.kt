@@ -52,6 +52,11 @@ class UserRepositoryImpl(
         private var lastSync: Date? = null
     }
 
+    override fun close() {
+        super.close()
+        taskRepository.close()
+    }
+
     override fun getUser(): Flow<User?> = authenticationHandler.userIDFlow.flatMapLatest { getUser(it) }
 
     override fun getUser(userID: String): Flow<User?> = localRepository.getUser(userID)
@@ -100,22 +105,62 @@ class UserRepositoryImpl(
     override suspend fun retrieveUser(
         withTasks: Boolean,
         forced: Boolean,
-        overrideExisting: Boolean
+        overrideExisting: Boolean,
+        expectedUserID: String?,
+        suppressConnectionErrors: Boolean,
+        expectedServerOrigin: String?,
     ): User? {
+        fun expectedIdentityMatches(): Boolean {
+            if (expectedUserID == null) return true
+            val authentication = apiClient.hostConfig.authenticationSnapshot()
+            return expectedServerOrigin?.isNotBlank() == true &&
+                currentUserID == expectedUserID &&
+                authentication.userID == expectedUserID &&
+                authentication.apiKey.isNotBlank() &&
+                authentication.serverOrigin == expectedServerOrigin
+        }
+        if (!expectedIdentityMatches()) return null
         // Only retrieve again after 3 minutes or it's forced.
         if (forced || lastSync == null || Date().time - (lastSync?.time ?: 0) > 180000) {
-            val user = apiClient.retrieveUser(withTasks) ?: return null
-            lastSync = Date()
-            withContext(Dispatchers.Main) {
-                localRepository.saveUser(user)
+            val user =
+                apiClient.retrieveUser(
+                    withTasks,
+                    expectedUserID,
+                    suppressConnectionErrors,
+                    expectedServerOrigin,
+                ) ?: return null
+            if (!expectedIdentityMatches() ||
+                expectedUserID != null && user.id != expectedUserID
+            ) {
+                return null
             }
+            if (expectedUserID != null && withTasks &&
+                (user.tasksOrder == null || user.tasks == null)
+            ) {
+                return null
+            }
+            val savedForExpectedUser = withContext(Dispatchers.Main) {
+                if (!expectedIdentityMatches()) {
+                    false
+                } else {
+                    localRepository.saveUser(user)
+                    true
+                }
+            }
+            if (!savedForExpectedUser) return null
             if (withTasks) {
                 val id = user.id
                 val tasksOrder = user.tasksOrder
                 val tasks = user.tasks
                 if (id != null && tasksOrder != null && tasks != null) {
+                    if (!expectedIdentityMatches()) return null
                     taskRepository.saveTasks(id, tasksOrder, tasks)
+                    if (!expectedIdentityMatches()) return null
                 }
+            }
+            lastSync = Date()
+            if (expectedUserID != null) {
+                return user
             }
             val calendar = GregorianCalendar()
             val timeZone = calendar.timeZone

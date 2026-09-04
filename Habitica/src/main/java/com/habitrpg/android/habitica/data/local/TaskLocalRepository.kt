@@ -16,6 +16,8 @@ interface TaskLocalRepository : BaseLocalRepository {
 
     fun getTasks(userId: String): Flow<List<Task>>
 
+    fun getTasksIncludingPending(userId: String): Flow<List<Task>>
+
     fun saveTasks(
         ownerID: String,
         tasksOrder: TasksOrder,
@@ -24,9 +26,46 @@ interface TaskLocalRepository : BaseLocalRepository {
 
     fun deleteTask(taskID: String)
 
+    fun deleteTask(
+        taskID: String,
+        ownerID: String,
+    )
+
+    fun replaceTask(
+        taskID: String,
+        task: Task,
+    )
+
+    fun replaceTask(
+        taskID: String,
+        ownerID: String,
+        task: Task,
+    )
+
+    fun resolveTaskID(
+        taskID: String,
+        alias: String,
+    ): String
+
+    fun resolveTaskID(
+        taskID: String,
+        alias: String,
+        ownerID: String,
+    ): String
+
     fun getTask(taskId: String): Flow<Task>
 
+    fun getTask(
+        taskId: String,
+        ownerID: String,
+    ): Flow<Task>
+
     fun getTaskCopy(taskId: String): Flow<Task>
+
+    fun getTaskCopy(
+        taskId: String,
+        ownerID: String,
+    ): Flow<Task>
 
     fun markTaskCompleted(
         taskId: String,
@@ -38,6 +77,14 @@ interface TaskLocalRepository : BaseLocalRepository {
         secondPosition: Int
     )
 
+    fun moveTaskToPosition(
+        taskID: String,
+        ownerID: String,
+        serverOrigin: String,
+        taskType: TaskType,
+        newPosition: Int,
+    )
+
     fun getTaskAtPosition(
         taskType: String,
         position: Int
@@ -47,12 +94,25 @@ interface TaskLocalRepository : BaseLocalRepository {
 
     fun updateTaskPositions(taskOrder: List<String>)
 
+    fun updateTaskPositions(
+        taskOrder: List<String>,
+        ownerID: String,
+    )
+
     fun saveCompletedTodos(
         userId: String,
         tasks: MutableCollection<Task>
     )
 
     fun getErroredTasks(userID: String): Flow<List<Task>>
+
+    fun getPendingTaskCreations(userID: String): Flow<List<Task>>
+
+    fun getPendingTaskDeletions(userID: String): Flow<List<Task>>
+
+    fun getPendingTaskActions(userID: String): Flow<List<Task>>
+
+    fun getPendingTaskScoreRefreshes(userID: String): Flow<List<Task>>
 
     fun getUser(userID: String): Flow<User>
 

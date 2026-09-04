@@ -8,7 +8,9 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
 import com.google.gson.JsonSerializationContext
 import com.google.gson.JsonSerializer
+import com.habitrpg.android.habitica.data.sync.offlineCreateAlias
 import com.habitrpg.android.habitica.extensions.getAsString
+import com.habitrpg.android.habitica.models.Tag
 import com.habitrpg.android.habitica.models.tasks.ChecklistItem
 import com.habitrpg.android.habitica.models.tasks.Days
 import com.habitrpg.android.habitica.models.tasks.RemindersItem
@@ -64,6 +66,7 @@ class TaskSerializer : JsonSerializer<Task>, JsonDeserializer<Task> {
         val obj = json as? JsonObject ?: return task
         task.text = obj.getAsString("text")
         task.notes = obj.getAsString("notes")
+        task.alias = obj.getAsString("alias").takeIf { it.isNotBlank() }
         task.ownerID = obj.getAsString("userId")
         task.value = obj.get("value")?.asDouble ?: 0.0
         task.type = TaskType.from(obj.getAsString("type")) ?: TaskType.HABIT
@@ -98,16 +101,30 @@ class TaskSerializer : JsonSerializer<Task>, JsonDeserializer<Task> {
                 task.nextDue?.add(context.deserialize(due, Date::class.java))
             }
         }
+        if (obj.has("tags") && obj.get("tags").isJsonArray) {
+            task.tags = RealmList()
+            obj.getAsJsonArray("tags").forEach { tagElement ->
+                if (tagElement.isJsonPrimitive && tagElement.asJsonPrimitive.isString) {
+                    task.tags?.add(Tag().apply { id = tagElement.asString })
+                }
+            }
+        }
         if (obj.has("checklist")) {
             task.checklist = RealmList()
-            for (checklistElement in obj.getAsJsonArray("checklist")) {
+            for ((position, checklistElement) in obj.getAsJsonArray("checklist").withIndex()) {
                 val checklistObject = checklistElement.asJsonObject
                 task.checklist?.add(
                     ChecklistItem(
                         checklistObject.getAsString("id"),
                         checklistObject.getAsString("text"),
                         checklistObject.get("completed").asBoolean
-                    )
+                    ).apply {
+                        this.position =
+                            checklistObject.get("position")
+                                ?.takeUnless { it.isJsonNull }
+                                ?.asInt
+                                ?: position
+                    }
                 )
             }
         }
@@ -161,6 +178,12 @@ class TaskSerializer : JsonSerializer<Task>, JsonDeserializer<Task> {
     ): JsonElement {
         val obj = JsonObject()
         obj.addProperty("_id", task.id)
+        if (task.pendingCreate) {
+            obj.addProperty(
+                "alias",
+                task.alias?.takeIf { it.isNotBlank() } ?: task.id?.let(::offlineCreateAlias),
+            )
+        }
         obj.addProperty("text", task.text)
         obj.addProperty("notes", task.notes)
         obj.addProperty("value", task.value)
@@ -211,7 +234,10 @@ class TaskSerializer : JsonSerializer<Task>, JsonDeserializer<Task> {
                 if (task.reminders != null) {
                     obj.add("reminders", serializeReminders(task.reminders))
                 }
-                obj.addProperty("completed", task.completed)
+                obj.addProperty(
+                    "completed",
+                    task.completed && !(task.pendingCreate && task.pendingScoreUp),
+                )
             }
 
             else -> {
@@ -227,7 +253,7 @@ class TaskSerializer : JsonSerializer<Task>, JsonDeserializer<Task> {
             val jsonObject = JsonObject()
             jsonObject.addProperty("text", item.text)
             jsonObject.addProperty("id", item.id)
-            jsonObject.addProperty("completed", item.completed)
+            jsonObject.addProperty("completed", item.completed && !item.pendingSync)
             jsonArray.add(jsonObject)
         }
         return jsonArray

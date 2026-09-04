@@ -34,7 +34,10 @@ interface UserRepository : BaseRepository {
     suspend fun retrieveUser(
         withTasks: Boolean = false,
         forced: Boolean = false,
-        overrideExisting: Boolean = false
+        overrideExisting: Boolean = false,
+        expectedUserID: String? = null,
+        suppressConnectionErrors: Boolean = false,
+        expectedServerOrigin: String? = null,
     ): User?
 
     suspend fun revive(): Equipment?

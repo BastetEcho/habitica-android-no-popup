@@ -13,6 +13,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.os.Bundle
 import android.util.Log
 import androidx.appcompat.app.AppCompatDelegate
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.edit
 import androidx.core.os.LocaleListCompat
 import androidx.lifecycle.DefaultLifecycleObserver
@@ -27,11 +28,15 @@ import com.google.firebase.remoteconfig.FirebaseRemoteConfig
 import com.google.firebase.remoteconfig.FirebaseRemoteConfigException
 import com.google.firebase.remoteconfig.FirebaseRemoteConfigSettings
 import com.habitrpg.android.habitica.data.ApiClient
+import com.habitrpg.android.habitica.data.local.HabiticaRealmMigration
+import com.habitrpg.android.habitica.data.sync.OfflineTaskSyncScheduler
 import com.habitrpg.android.habitica.extensions.DateUtils
 import com.habitrpg.android.habitica.helpers.AdHandler
 import com.habitrpg.android.habitica.helpers.Analytics
+import com.habitrpg.android.habitica.helpers.TaskAlarmManager
 import com.habitrpg.android.habitica.helpers.notifications.PushNotificationManager
 import com.habitrpg.android.habitica.helpers.notifications.PushNotificationManager.Companion.DEVICE_TOKEN_PREFERENCE_KEY
+import com.habitrpg.android.habitica.models.tasks.Task
 import com.habitrpg.android.habitica.models.user.User
 import com.habitrpg.android.habitica.modules.AuthenticationHandler
 import com.habitrpg.android.habitica.ui.activities.BaseActivity
@@ -101,6 +106,54 @@ class ApplicationLifecycleTracker(private val sharedPreferences: SharedPreferenc
     }
 }
 
+/** Persists the logged-out preference state before any in-memory credentials are cleared. */
+internal fun persistLogoutPreferences(
+    preferences: SharedPreferences,
+    serverURL: String?,
+    useReminder: Boolean,
+    reminderTime: String?,
+    themeMode: String?,
+    launchScreen: String?,
+): Boolean {
+    val previousPreferences =
+        preferences.all.mapValues { (_, value) ->
+            if (value is Set<*>) value.filterIsInstance<String>().toSet() else value
+        }
+    val logoutCommitted =
+        preferences.edit()
+            .clear()
+            .putString("server_url", serverURL)
+            .putBoolean("use_reminder", useReminder)
+            .putString("reminder_time", reminderTime)
+            .putString("theme_mode", themeMode)
+            .putString("launch_screen", launchScreen)
+            .putBoolean("analytics_consent_given", false)
+            .commit()
+    if (!logoutCommitted) {
+        restorePreferencesSnapshot(preferences, previousPreferences)
+    }
+    return logoutCommitted
+}
+
+/** Restores the live preference state after a failed logout disk commit. */
+private fun restorePreferencesSnapshot(
+    preferences: SharedPreferences,
+    snapshot: Map<String, Any?>,
+) {
+    val editor = preferences.edit().clear()
+    snapshot.forEach { (key, value) ->
+        when (value) {
+            is Boolean -> editor.putBoolean(key, value)
+            is Float -> editor.putFloat(key, value)
+            is Int -> editor.putInt(key, value)
+            is Long -> editor.putLong(key, value)
+            is String -> editor.putString(key, value)
+            is Set<*> -> editor.putStringSet(key, value.filterIsInstance<String>().toSet())
+        }
+    }
+    editor.commit()
+}
+
 @HiltAndroidApp
 abstract class HabiticaBaseApplication : Application(), Application.ActivityLifecycleCallbacks {
     @Inject
@@ -114,6 +167,9 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
 
     @Inject
     internal lateinit var authenticationHandler: AuthenticationHandler
+
+    @Inject
+    internal lateinit var offlineTaskSyncScheduler: OfflineTaskSyncScheduler
 
     private lateinit var lifecycleTracker: ApplicationLifecycleTracker
 
@@ -133,6 +189,10 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
         }
         registerActivityLifecycleCallbacks(this)
         setupRealm()
+        val authenticatedUserID = authenticationHandler.currentUserID.orEmpty()
+        if (authenticatedUserID.isNotBlank() && lazyApiHelper.hasAuthenticationKeys()) {
+            offlineTaskSyncScheduler.enqueue(authenticatedUserID)
+        }
         setLocale()
         setupLocaleChangeListener()
         setupRemoteConfig()
@@ -246,8 +306,8 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
         Realm.init(this)
         val builder =
             RealmConfiguration.Builder()
-                .schemaVersion(1)
-                .deleteRealmIfMigrationNeeded()
+                .schemaVersion(HabiticaRealmMigration.OUTBOX_SCHEMA_VERSION)
+                .migration(HabiticaRealmMigration())
                 .allowWritesOnUiThread(true)
                 .compactOnLaunch { totalBytes, usedBytes ->
                     // Compact if the file is over 100MB in size and less than 50% 'used'
@@ -311,10 +371,37 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
 
     override fun deleteDatabase(name: String): Boolean {
         val realm = Realm.getDefaultInstance()
+        val pendingTasks =
+            realm.copyFromRealm(
+                realm.where(Task::class.java)
+                    .beginGroup()
+                    .equalTo("pendingCreate", true)
+                    .or()
+                    .equalTo("pendingDelete", true)
+                    .or()
+                    .equalTo("pendingDeleteAfterScore", true)
+                    .or()
+                    .equalTo("pendingUpdate", true)
+                    .or()
+                    .equalTo("pendingPosition", true)
+                    .or()
+                    .equalTo("pendingScoreUp", true)
+                    .or()
+                    .equalTo("pendingScoreDown", true)
+                    .or()
+                    .isNotNull("pendingScoreSnapshot")
+                    .or()
+                    .equalTo("pendingScoreRefresh", true)
+                    .or()
+                    .equalTo("pendingChecklist", true)
+                    .endGroup()
+                    .findAll()
+            )
         realm.executeTransaction { realm1 ->
             realm1.deleteAll()
-            realm1.close()
+            realm1.insertOrUpdate(pendingTasks)
         }
+        realm.close()
         return true
     }
 
@@ -390,10 +477,50 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
             return context.applicationContext as? HabiticaBaseApplication
         }
 
-        fun deleteDatabase(context: Context) {
+        fun deleteDatabase(
+            context: Context,
+            clearRetainedTaskSideEffects: Boolean = false,
+        ) {
             val realm = Realm.getDefaultInstance()
-            getInstance(context)?.deleteDatabase(realm.path)
+            val retainedTasks =
+                if (clearRetainedTaskSideEffects) {
+                    realm.copyFromRealm(
+                        realm.where(Task::class.java)
+                            .beginGroup()
+                            .equalTo("pendingCreate", true)
+                            .or()
+                            .equalTo("pendingDelete", true)
+                            .or()
+                            .equalTo("pendingDeleteAfterScore", true)
+                            .or()
+                            .equalTo("pendingUpdate", true)
+                            .or()
+                            .equalTo("pendingPosition", true)
+                            .or()
+                            .equalTo("pendingScoreUp", true)
+                            .or()
+                            .equalTo("pendingScoreDown", true)
+                            .or()
+                            .isNotNull("pendingScoreSnapshot")
+                            .or()
+                            .equalTo("pendingScoreRefresh", true)
+                            .or()
+                            .equalTo("pendingChecklist", true)
+                            .endGroup()
+                            .findAll()
+                    )
+                } else {
+                    emptyList()
+                }
+            val databaseDeleted = getInstance(context)?.deleteDatabase(realm.path) == true
             realm.close()
+            if (databaseDeleted && clearRetainedTaskSideEffects) {
+                runCatching { TaskAlarmManager.cancelAlarmsForTasks(context, retainedTasks) }
+                runCatching {
+                    val notificationManager = NotificationManagerCompat.from(context)
+                    retainedTasks.forEach { task -> notificationManager.cancel(task.id.hashCode()) }
+                }
+            }
         }
 
         fun logout(context: Context, user: User? = null) {
@@ -409,32 +536,40 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
                 val lightMode = preferences.getString("theme_mode", "system")
                 val launchScreen = preferences.getString("launch_screen", "")
 
-                // set the user and refreshed token in the push manager, so we can remove the push device
-                if (deviceToken.isNotEmpty() && user != null) {
-                    pushManager?.setUser(user)
-                    pushManager?.refreshedToken = deviceToken
-                    pushManager?.removePushDeviceUsingStoredToken()
+                val logoutPersisted =
+                    persistLogoutPreferences(
+                        preferences,
+                        serverURL,
+                        useReminder,
+                        reminderTime,
+                        lightMode,
+                        launchScreen,
+                    )
+                if (!logoutPersisted) {
+                    Log.e("HabiticaLogout", "Could not persist logout state; logout aborted.")
+                    return@launchCatching
                 }
 
-                deleteDatabase(context)
-                
+                // Close repository and worker identity gates before the first suspension point.
+                instance?.authenticationHandler?.clear()
+
+                // Only push deregistration may use the old HostConfig before it is cleared below.
+                runCatching {
+                    if (deviceToken.isNotEmpty() && user != null) {
+                        pushManager?.setUser(user)
+                        pushManager?.refreshedToken = deviceToken
+                        pushManager?.removePushDeviceUsingStoredToken()
+                    }
+                }
+                instance?.lazyApiHelper?.updateAuthenticationCredentials(null, null)
+
+                deleteDatabase(context, clearRetainedTaskSideEffects = true)
+
                 Analytics.setAnalyticsConsent(false)
                 Analytics.clearUserID()
-                
-                preferences.edit {
-                    clear()
-                    putString("server_url", serverURL)
-                    putBoolean("use_reminder", useReminder)
-                    putString("reminder_time", reminderTime)
-                    putString("theme_mode", lightMode)
-                    putString("launch_screen", launchScreen)
-                    putBoolean("analytics_consent_given", false)
-                }
-                
+
                 pushManager?.clearUser()
 
-                instance?.lazyApiHelper?.updateAuthenticationCredentials(null, null)
-                instance?.authenticationHandler?.clear()
                 Wearable.getCapabilityClient(context).removeLocalCapability("provide_auth")
                 runCatching { WidgetRefreshWorker.clearAllForLogout(context.applicationContext) }
                 runCatching { CronBoundaryRefreshWorker.cancel(context.applicationContext) }

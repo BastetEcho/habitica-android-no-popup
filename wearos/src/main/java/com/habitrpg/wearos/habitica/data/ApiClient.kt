@@ -139,11 +139,12 @@ constructor(
                 .addNetworkInterceptor { chain ->
                     val original = chain.request()
                     var builder: Request.Builder = original.newBuilder()
-                    if (this.hostConfig.hasAuthentication()) {
+                    val authentication = hostConfig.authenticationSnapshot()
+                    if (authentication.userID.isNotEmpty() && authentication.apiKey.isNotEmpty()) {
                         builder =
                             builder
-                                .header("x-api-key", this.hostConfig.apiKey)
-                                .header("x-api-user", this.hostConfig.userID)
+                                .header("x-api-key", authentication.apiKey)
+                                .header("x-api-user", authentication.userID)
                     }
                     builder =
                         builder.header("x-client", "habitica-android")
@@ -179,8 +180,7 @@ constructor(
         userID: String?,
         apiToken: String?
     ) {
-        this.hostConfig.userID = userID ?: ""
-        this.hostConfig.apiKey = apiToken ?: ""
+        this.hostConfig.updateAuthentication(userID.orEmpty(), apiToken.orEmpty())
     }
 
     private val adapter: JsonAdapter<ErrorResponse>? =

@@ -17,6 +17,7 @@ import com.habitrpg.android.habitica.R
 import com.habitrpg.android.habitica.data.TaskRepository
 import com.habitrpg.android.habitica.helpers.TaskAlarmManager
 import com.habitrpg.android.habitica.models.tasks.Task
+import com.habitrpg.android.habitica.modules.AuthenticationHandler
 import com.habitrpg.android.habitica.ui.activities.MainActivity
 import com.habitrpg.common.habitica.helpers.ExceptionHandler
 import com.habitrpg.shared.habitica.HLogger
@@ -30,6 +31,9 @@ import javax.inject.Inject
 @AndroidEntryPoint
 class TaskReceiver : BroadcastReceiver() {
     @Inject
+    lateinit var authenticationHandler: AuthenticationHandler
+
+    @Inject
     lateinit var taskAlarmManager: TaskAlarmManager
 
     @Inject
@@ -40,16 +44,25 @@ class TaskReceiver : BroadcastReceiver() {
         intent: Intent
     ) {
         HLogger.log(LogLevel.INFO, this::javaClass.name, "onReceive")
+        val expectedUserID = authenticationHandler.currentUserID?.takeIf { it.isNotBlank() }
+            ?: return
         val extras = intent.extras
         if (extras != null) {
             val taskId = extras.getString(TaskAlarmManager.TASK_ID_INTENT_KEY)
             // This will set up the next reminders for dailies
             if (taskId != null) {
-                taskAlarmManager.addAlarmForTaskId(taskId)
+                taskAlarmManager.addAlarmForTaskId(taskId, expectedUserID)
             }
 
             MainScope().launch(ExceptionHandler.coroutine()) {
-                val task = taskRepository.getTask(taskId ?: "").firstOrNull() ?: return@launch
+                val task =
+                    taskRepository.getTask(taskId ?: "", expectedUserID).firstOrNull()
+                        ?: return@launch
+                if (authenticationHandler.currentUserID != expectedUserID ||
+                    !task.isReminderVisibleFor(expectedUserID)
+                ) {
+                    return@launch
+                }
                 if (task.isUpdatedToday && task.completed) {
                     return@launch
                 }
@@ -94,6 +107,11 @@ class TaskReceiver : BroadcastReceiver() {
         val notificationManager = NotificationManagerCompat.from(context)
         notificationManager.safeNotify(context, task.id.hashCode(), notificationBuilder.build())
     }
+}
+
+/** Returns true only when a reminder belongs to the account that is still authenticated. */
+internal fun Task.isReminderVisibleFor(authenticatedUserID: String?): Boolean {
+    return !authenticatedUserID.isNullOrBlank() && ownerID == authenticatedUserID
 }
 
 fun NotificationManagerCompat.safeNotify(context: Context, code: Int, notification: Notification) {

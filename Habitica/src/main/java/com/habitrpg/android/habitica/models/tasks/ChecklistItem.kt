@@ -21,6 +21,7 @@ open class ChecklistItem : RealmObject, BaseMainObject, Parcelable {
     var text: String? = null
     var completed: Boolean = false
     var position: Int = 0
+    var pendingSync: Boolean = false
 
     @JvmOverloads
     constructor(id: String? = null, text: String? = null, completed: Boolean = false) {
@@ -37,6 +38,8 @@ open class ChecklistItem : RealmObject, BaseMainObject, Parcelable {
         this.text = item.text
         this.id = item.id
         this.completed = item.completed
+        this.position = item.position
+        this.pendingSync = item.pendingSync
     }
 
     override fun describeContents(): Int {
@@ -51,6 +54,7 @@ open class ChecklistItem : RealmObject, BaseMainObject, Parcelable {
         dest.writeString(text)
         dest.writeByte(if (completed) 1.toByte() else 0.toByte())
         dest.writeInt(position)
+        dest.writeByte(if (pendingSync) 1.toByte() else 0.toByte())
     }
 
     companion object CREATOR : Parcelable.Creator<ChecklistItem>, RealmModel {
@@ -63,6 +67,7 @@ open class ChecklistItem : RealmObject, BaseMainObject, Parcelable {
         text = source.readString()
         completed = source.readByte() == 1.toByte()
         position = source.readInt()
+        pendingSync = source.readByte() == 1.toByte()
     }
 
     override fun equals(other: Any?): Boolean {

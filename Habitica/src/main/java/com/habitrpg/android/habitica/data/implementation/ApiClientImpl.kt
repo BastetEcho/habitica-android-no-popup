@@ -8,6 +8,8 @@ import com.habitrpg.android.habitica.R
 import com.habitrpg.android.habitica.api.ApiService
 import com.habitrpg.android.habitica.api.GSonFactoryCreator
 import com.habitrpg.android.habitica.data.ApiClient
+import com.habitrpg.android.habitica.data.TaskServerState
+import com.habitrpg.android.habitica.data.sync.isOfflineCreateAlias
 import com.habitrpg.android.habitica.helpers.Analytics
 import com.habitrpg.android.habitica.helpers.NotificationsManager
 import com.habitrpg.android.habitica.models.Achievement
@@ -37,6 +39,7 @@ import com.habitrpg.android.habitica.models.tasks.TaskList
 import com.habitrpg.android.habitica.models.user.Items
 import com.habitrpg.android.habitica.models.user.Stats
 import com.habitrpg.android.habitica.models.user.User
+import com.habitrpg.common.habitica.api.AuthenticationSnapshot
 import com.habitrpg.common.habitica.api.HostConfig
 import com.habitrpg.common.habitica.api.Server
 import com.habitrpg.common.habitica.models.HabitResponse
@@ -53,6 +56,9 @@ import com.habitrpg.shared.habitica.models.responses.TaskDirectionData
 import com.habitrpg.shared.habitica.models.responses.VerifyEmailResponse
 import com.habitrpg.shared.habitica.models.responses.VerifyUsernameResponse
 import okhttp3.Cache
+import okhttp3.CacheControl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.logging.HttpLoggingInterceptor
@@ -64,13 +70,86 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import java.io.File
 import java.io.IOException
-import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.Date
 import java.util.GregorianCalendar
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLException
+
+private const val EXPECTED_USER_HEADER = "X-Habitica-Expected-User"
+private const val EXPECTED_SERVER_ORIGIN_HEADER = "X-Habitica-Expected-Server-Origin"
+
+/** Carries one validated authentication pair through OkHttp without sending it on the wire. */
+internal class OutboxAuthentication(
+    val snapshot: AuthenticationSnapshot,
+)
+
+/** Confirms that a queued request is using the exact pinned API base URL. */
+internal fun Request.matchesServerOrigin(serverOrigin: String): Boolean {
+    val expectedUrl = serverOrigin.toHttpUrlOrNull() ?: return false
+    val expectedPath =
+        expectedUrl.encodedPath.let { path -> if (path.endsWith('/')) path else "$path/" }
+    return url.scheme == expectedUrl.scheme &&
+        url.host == expectedUrl.host &&
+        url.port == expectedUrl.port &&
+        url.encodedPath.startsWith(expectedPath)
+}
+
+/** Returns false when a queued response belongs to credentials that are no longer active. */
+internal fun Request.matchesCurrentOutboxAuthentication(hostConfig: HostConfig): Boolean {
+    val pinnedAuthentication = tag(OutboxAuthentication::class.java)?.snapshot ?: return true
+    return pinnedAuthentication == hostConfig.authenticationSnapshot() &&
+        matchesServerOrigin(pinnedAuthentication.serverOrigin)
+}
+
+/** Classifies a successful task lookup without treating an unrelated body as proof of absence. */
+internal fun taskServerStateForResponse(
+    identifier: String,
+    task: Task,
+): TaskServerState {
+    return when {
+        isOfflineCreateAlias(identifier) && task.alias == identifier -> TaskServerState.PRESENT
+        !isOfflineCreateAlias(identifier) && task.id == identifier -> TaskServerState.PRESENT
+        else -> TaskServerState.UNKNOWN
+    }
+}
+
+/** Validates queued work before cache lookup and requires a fresh network response. */
+internal class ExpectedUserInterceptor(
+    private val hostConfig: HostConfig,
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): okhttp3.Response {
+        val original = chain.request()
+        val expectedUserID = original.header(EXPECTED_USER_HEADER) ?: return chain.proceed(original)
+        val expectedServerOrigin =
+            original.header(EXPECTED_SERVER_ORIGIN_HEADER)
+                ?: throw IOException("Queued request has no pinned server origin.")
+        val authentication = hostConfig.authenticationSnapshot()
+        if (expectedUserID != authentication.userID || authentication.apiKey.isBlank() ||
+            expectedServerOrigin != authentication.serverOrigin ||
+            !original.matchesServerOrigin(expectedServerOrigin)
+        ) {
+            throw IOException("Authentication identity changed before queued request.")
+        }
+        val request =
+            original.newBuilder()
+                .removeHeader(EXPECTED_USER_HEADER)
+                .removeHeader(EXPECTED_SERVER_ORIGIN_HEADER)
+                .cacheControl(
+                    CacheControl.Builder()
+                        .noCache()
+                        .noStore()
+                        .build(),
+                )
+                .tag(
+                    OutboxAuthentication::class.java,
+                    OutboxAuthentication(authentication),
+                )
+                .build()
+        return chain.proceed(request)
+    }
+}
 
 class ApiClientImpl(
     private val converter: Converter.Factory,
@@ -83,6 +162,9 @@ class ApiClientImpl(
     private lateinit var apiService: ApiService
 
     private fun <T> processResponse(response: Response<HabitResponse<T>>): T? {
+        if (!response.raw().request.matchesCurrentOutboxAuthentication(hostConfig)) {
+            throw IOException("Authentication identity changed during queued request.")
+        }
         val habitResponse = response.body()
         if (habitResponse == null && response.errorBody() != null) {
             throw HttpException(response)
@@ -96,6 +178,20 @@ class ApiClientImpl(
 
     private suspend fun <T> process(apiCall: suspend () -> Response<HabitResponse<T>>): T? {
         return process(apiCall, null, true, false)
+    }
+
+    private suspend fun <T> process(
+        suppressConnectionErrors: Boolean,
+        apiCall: suspend () -> Response<HabitResponse<T>>
+    ): T? {
+        return try {
+            processResponse(apiCall())
+        } catch (throwable: Throwable) {
+            if (!suppressConnectionErrors) {
+                accept(throwable)
+            }
+            null
+        }
     }
 
     private suspend fun <T> process(apiCall: suspend () -> Response<HabitResponse<T>>,
@@ -121,12 +217,17 @@ class ApiClientImpl(
         return null
     }
 
-    private suspend fun <T> processWithIfSuccess(apiCall: suspend () -> Response<HabitResponse<T>>): Boolean {
+    private suspend fun <T> processWithIfSuccess(
+        suppressConnectionErrors: Boolean = false,
+        apiCall: suspend () -> Response<HabitResponse<T>>,
+    ): Boolean {
         try {
             processResponse(apiCall())
             return true
         } catch (throwable: Throwable) {
-            accept(throwable)
+            if (!suppressConnectionErrors) {
+                accept(throwable)
+            }
             return false
         }
     }
@@ -161,14 +262,22 @@ class ApiClientImpl(
         val client =
             OkHttpClient.Builder()
                 .cache(cache)
+                .addInterceptor(ExpectedUserInterceptor(hostConfig))
+                .addInterceptor(logging)
                 .addNetworkInterceptor { chain ->
                     val original = chain.request()
-                    var builder: Request.Builder = original.newBuilder()
-                    if (this.hostConfig.hasAuthentication()) {
+                    val authentication =
+                        original.tag(OutboxAuthentication::class.java)?.snapshot
+                            ?: hostConfig.authenticationSnapshot()
+                    var builder: Request.Builder =
+                        original.newBuilder()
+                            .removeHeader(EXPECTED_USER_HEADER)
+                            .removeHeader(EXPECTED_SERVER_ORIGIN_HEADER)
+                    if (authentication.userID.isNotEmpty() && authentication.apiKey.isNotEmpty()) {
                         builder =
                             builder
-                                .header("x-api-key", this.hostConfig.apiKey)
-                                .header("x-api-user", this.hostConfig.userID)
+                                .header("x-api-key", authentication.apiKey)
+                                .header("x-api-user", authentication.userID)
                     }
                     builder =
                         builder.header("x-client", "habitica-android")
@@ -184,6 +293,9 @@ class ApiClientImpl(
                             .build()
                     lastAPICallURL = original.url.toString()
                     val response = chain.proceed(request)
+                    if (!request.matchesCurrentOutboxAuthentication(hostConfig)) {
+                        return@addNetworkInterceptor response
+                    }
                     if (response.isSuccessful) {
                         hideConnectionProblemDialog()
                         return@addNetworkInterceptor response
@@ -230,7 +342,6 @@ class ApiClientImpl(
                         }
                     }
                 }
-                .addInterceptor(logging)
                 .readTimeout(2400, TimeUnit.SECONDS)
                 .build()
 
@@ -248,7 +359,7 @@ class ApiClientImpl(
 
     override fun updateServerUrl(newAddress: String?) {
         if (!newAddress.isNullOrBlank()) {
-            hostConfig.address = newAddress
+            hostConfig.updateServerAddress(newAddress)
             buildRetrofit()
         }
     }
@@ -323,21 +434,17 @@ class ApiClientImpl(
 
     fun accept(throwable: Throwable) {
         val throwableClass = throwable.javaClass
-        if (SocketTimeoutException::class.java.isAssignableFrom(throwableClass)) {
+        if (throwable is SocketTimeoutException ||
+            throwable is UnknownHostException ||
+            throwable is IOException && throwable !is SSLException
+        ) {
             return
         }
 
         var isUserInputCall = false
         @Suppress("DEPRECATION")
-        if (SocketException::class.java.isAssignableFrom(throwableClass) ||
-            SSLException::class.java.isAssignableFrom(throwableClass)
-        ) {
+        if (SSLException::class.java.isAssignableFrom(throwableClass)) {
             this.showConnectionProblemDialog(R.string.internal_error_api, isUserInputCall)
-        } else if (throwableClass == SocketTimeoutException::class.java || UnknownHostException::class.java == throwableClass || IOException::class.java == throwableClass) {
-            this.showConnectionProblemDialog(
-                R.string.network_error_no_network_body,
-                isUserInputCall
-            )
         } else if (HttpException::class.java.isAssignableFrom(throwable.javaClass)) {
             val error = throwable as HttpException
             val res = getErrorResponse(error)
@@ -407,10 +514,25 @@ class ApiClientImpl(
         }
     }
 
-    override suspend fun retrieveUser(withTasks: Boolean): User? {
-        val user = process { apiService.getUser("balance,items,permissions,challenges,lastCron,needsCron,loginIncentives,achievements,backer,contributor,purchased,invitations,party,profile,stats,tasksOrder,pushDevices,tags,pinnedItems,unpinnedItems,pinnedItemsOrder") }
-        val tasks = getTasks()
-        user?.tasks = tasks
+    override suspend fun retrieveUser(
+        withTasks: Boolean,
+        expectedUserID: String?,
+        suppressConnectionErrors: Boolean,
+        expectedServerOrigin: String?,
+    ): User? {
+        val user =
+            process(suppressConnectionErrors) {
+                apiService.getUser(
+                    "balance,items,permissions,challenges,lastCron,needsCron,loginIncentives," +
+                        "achievements,backer,contributor,purchased,invitations,party,profile,stats," +
+                        "tasksOrder,pushDevices,tags,pinnedItems,unpinnedItems,pinnedItemsOrder",
+                    expectedUserID,
+                    expectedServerOrigin,
+                )
+            } ?: return null
+        val tasks = getTasks(suppressConnectionErrors, expectedUserID, expectedServerOrigin)
+        if (withTasks && tasks == null) return null
+        user.tasks = tasks
         return user
     }
 
@@ -426,7 +548,7 @@ class ApiClientImpl(
     }
 
     override fun hasAuthenticationKeys(): Boolean {
-        return this.hostConfig.userID.isNotEmpty() && hostConfig.apiKey.isNotEmpty()
+        return hostConfig.hasAuthentication()
     }
 
     private fun showConnectionProblemDialog(
@@ -487,8 +609,7 @@ class ApiClientImpl(
         userID: String?,
         apiToken: String?
     ) {
-        this.hostConfig.userID = userID ?: ""
-        this.hostConfig.apiKey = apiToken ?: ""
+        this.hostConfig.updateAuthentication(userID.orEmpty(), apiToken.orEmpty())
         Analytics.setUserID(hostConfig.userID)
     }
 
@@ -622,7 +743,14 @@ class ApiClientImpl(
         return process { apiService.hatchPet(eggKey, hatchingPotionKey) }
     }
 
-    override suspend fun getTasks(): TaskList? = process { apiService.getTasks(false) }
+    override suspend fun getTasks(
+        suppressConnectionErrors: Boolean,
+        expectedUserID: String?,
+        expectedServerOrigin: String?,
+    ): TaskList? =
+        process(suppressConnectionErrors) {
+            apiService.getTasks(false, expectedUserID, expectedServerOrigin)
+        }
 
     override suspend fun getTasks(type: String): TaskList? {
         return process { apiService.getTasks(type) }
@@ -643,15 +771,49 @@ class ApiClientImpl(
         return process { apiService.unlockPath(path) }
     }
 
-    override suspend fun getTask(id: String): Task? {
-        return process { apiService.getTask(id) }
+    override suspend fun getTask(
+        id: String,
+        suppressConnectionErrors: Boolean,
+        expectedUserID: String?,
+        expectedServerOrigin: String?,
+    ): Task? {
+        return process(suppressConnectionErrors) {
+            apiService.getTask(id, expectedUserID, expectedServerOrigin)
+        }
+    }
+
+    override suspend fun getTaskServerState(
+        id: String,
+        expectedUserID: String?,
+        expectedServerOrigin: String?,
+    ): TaskServerState {
+        return try {
+            val task = processResponse(apiService.getTask(id, expectedUserID, expectedServerOrigin))
+                ?: return TaskServerState.UNKNOWN
+            taskServerStateForResponse(id, task)
+        } catch (throwable: Throwable) {
+            when {
+                throwable is HttpException && throwable.code() == 404 -> TaskServerState.MISSING
+                else -> {
+                    if (expectedUserID == null) {
+                        accept(throwable)
+                    }
+                    TaskServerState.UNKNOWN
+                }
+            }
+        }
     }
 
     override suspend fun postTaskDirection(
         id: String,
-        direction: String
+        direction: String,
+        suppressConnectionErrors: Boolean,
+        expectedUserID: String?,
+        expectedServerOrigin: String?,
     ): TaskDirectionData? {
-        return process { apiService.postTaskDirection(id, direction) }
+        return process(suppressConnectionErrors) {
+            apiService.postTaskDirection(id, direction, expectedUserID, expectedServerOrigin)
+        }
     }
 
     override suspend fun bulkScoreTasks(data: List<Map<String, String>>): BulkTaskScoringData? {
@@ -660,9 +822,14 @@ class ApiClientImpl(
 
     override suspend fun postTaskNewPosition(
         id: String,
-        position: Int
+        position: Int,
+        suppressConnectionErrors: Boolean,
+        expectedUserID: String?,
+        expectedServerOrigin: String?,
     ): List<String>? {
-        return process { apiService.postTaskNewPosition(id, position) }
+        return process(suppressConnectionErrors) {
+            apiService.postTaskNewPosition(id, position, expectedUserID, expectedServerOrigin)
+        }
     }
 
     override suspend fun postGroupTaskNewPosition(
@@ -674,13 +841,30 @@ class ApiClientImpl(
 
     override suspend fun scoreChecklistItem(
         taskId: String,
-        itemId: String
+        itemId: String,
+        suppressConnectionErrors: Boolean,
+        expectedUserID: String?,
+        expectedServerOrigin: String?,
     ): Task? {
-        return process { apiService.scoreChecklistItem(taskId, itemId) }
+        return process(suppressConnectionErrors) {
+            apiService.scoreChecklistItem(
+                taskId,
+                itemId,
+                expectedUserID,
+                expectedServerOrigin,
+            )
+        }
     }
 
-    override suspend fun createTask(item: Task): Task? {
-        return process { apiService.createTask(item) }
+    override suspend fun createTask(
+        item: Task,
+        suppressConnectionErrors: Boolean,
+        expectedUserID: String?,
+        expectedServerOrigin: String?,
+    ): Task? {
+        return process(suppressConnectionErrors) {
+            apiService.createTask(item, expectedUserID, expectedServerOrigin)
+        }
     }
 
     override suspend fun createGroupTask(
@@ -696,13 +880,25 @@ class ApiClientImpl(
 
     override suspend fun updateTask(
         id: String,
-        item: Task
+        item: Task,
+        suppressConnectionErrors: Boolean,
+        expectedUserID: String?,
+        expectedServerOrigin: String?,
     ): Task? {
-        return process { apiService.updateTask(id, item) }
+        return process(suppressConnectionErrors) {
+            apiService.updateTask(id, item, expectedUserID, expectedServerOrigin)
+        }
     }
 
-    override suspend fun deleteTask(id: String): Void? {
-        return process { apiService.deleteTask(id) }
+    override suspend fun deleteTask(
+        id: String,
+        suppressConnectionErrors: Boolean,
+        expectedUserID: String?,
+        expectedServerOrigin: String?,
+    ): Boolean {
+        return processWithIfSuccess(suppressConnectionErrors) {
+            apiService.deleteTask(id, expectedUserID, expectedServerOrigin)
+        }
     }
 
     override suspend fun createTag(tag: Tag): Tag? {
