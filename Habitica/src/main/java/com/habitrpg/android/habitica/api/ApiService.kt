@@ -49,6 +49,9 @@ import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
 
+private const val EXPECTED_USER_HEADER = "X-Habitica-Expected-User"
+private const val EXPECTED_SERVER_ORIGIN_HEADER = "X-Habitica-Expected-Server-Origin"
+
 @JvmSuppressWildcards
 interface ApiService {
     @GET("status")
@@ -57,7 +60,11 @@ interface ApiService {
     // user API
 
     @GET("user/")
-    suspend fun getUser(@Query("fields") fields: String?): Response<HabitResponse<User>>
+    suspend fun getUser(
+        @Query("fields") fields: String?,
+        @Header(EXPECTED_USER_HEADER) expectedUserID: String? = null,
+        @Header(EXPECTED_SERVER_ORIGIN_HEADER) expectedServerOrigin: String? = null,
+    ): Response<HabitResponse<User>>
 
     @POST("user/stat-sync")
     suspend fun syncUserStats(): Response<HabitResponse<User>>
@@ -72,7 +79,11 @@ interface ApiService {
     suspend fun getInboxConversations(): Response<HabitResponse<List<InboxConversation>>>
 
     @GET("tasks/user")
-    suspend fun getTasks(@Query("history") history: Boolean?): Response<HabitResponse<TaskList>>
+    suspend fun getTasks(
+        @Query("history") history: Boolean?,
+        @Header(EXPECTED_USER_HEADER) expectedUserID: String? = null,
+        @Header(EXPECTED_SERVER_ORIGIN_HEADER) expectedServerOrigin: String? = null,
+    ): Response<HabitResponse<TaskList>>
 
     @GET("world-state")
     suspend fun worldState(): Response<HabitResponse<WorldState>>
@@ -171,13 +182,17 @@ interface ApiService {
 
     @GET("tasks/{id}")
     suspend fun getTask(
-        @Path("id") id: String
+        @Path("id") id: String,
+        @Header(EXPECTED_USER_HEADER) expectedUserID: String? = null,
+        @Header(EXPECTED_SERVER_ORIGIN_HEADER) expectedServerOrigin: String? = null,
     ): Response<HabitResponse<Task>>
 
     @POST("tasks/{id}/score/{direction}")
     suspend fun postTaskDirection(
         @Path("id") id: String,
-        @Path("direction") direction: String
+        @Path("direction") direction: String,
+        @Header(EXPECTED_USER_HEADER) expectedUserID: String? = null,
+        @Header(EXPECTED_SERVER_ORIGIN_HEADER) expectedServerOrigin: String? = null,
     ): Response<HabitResponse<TaskDirectionData>>
 
     @POST("tasks/bulk-score")
@@ -188,7 +203,9 @@ interface ApiService {
     @POST("tasks/{id}/move/to/{position}")
     suspend fun postTaskNewPosition(
         @Path("id") id: String,
-        @Path("position") position: Int
+        @Path("position") position: Int,
+        @Header(EXPECTED_USER_HEADER) expectedUserID: String? = null,
+        @Header(EXPECTED_SERVER_ORIGIN_HEADER) expectedServerOrigin: String? = null,
     ): Response<HabitResponse<List<String>>>
 
     @POST("group-tasks/{id}/move/to/{position}")
@@ -200,12 +217,16 @@ interface ApiService {
     @POST("tasks/{taskId}/checklist/{itemId}/score")
     suspend fun scoreChecklistItem(
         @Path("taskId") taskId: String,
-        @Path("itemId") itemId: String
+        @Path("itemId") itemId: String,
+        @Header(EXPECTED_USER_HEADER) expectedUserID: String? = null,
+        @Header(EXPECTED_SERVER_ORIGIN_HEADER) expectedServerOrigin: String? = null,
     ): Response<HabitResponse<Task>>
 
     @POST("tasks/user")
     suspend fun createTask(
-        @Body item: Task
+        @Body item: Task,
+        @Header(EXPECTED_USER_HEADER) expectedUserID: String? = null,
+        @Header(EXPECTED_SERVER_ORIGIN_HEADER) expectedServerOrigin: String? = null,
     ): Response<HabitResponse<Task>>
 
     @POST("tasks/group/{groupId}")
@@ -222,12 +243,16 @@ interface ApiService {
     @PUT("tasks/{id}")
     suspend fun updateTask(
         @Path("id") id: String,
-        @Body item: Task
+        @Body item: Task,
+        @Header(EXPECTED_USER_HEADER) expectedUserID: String? = null,
+        @Header(EXPECTED_SERVER_ORIGIN_HEADER) expectedServerOrigin: String? = null,
     ): Response<HabitResponse<Task>>
 
     @DELETE("tasks/{id}")
     suspend fun deleteTask(
-        @Path("id") id: String
+        @Path("id") id: String,
+        @Header(EXPECTED_USER_HEADER) expectedUserID: String? = null,
+        @Header(EXPECTED_SERVER_ORIGIN_HEADER) expectedServerOrigin: String? = null,
     ): Response<HabitResponse<Void>>
 
     @POST("tags")

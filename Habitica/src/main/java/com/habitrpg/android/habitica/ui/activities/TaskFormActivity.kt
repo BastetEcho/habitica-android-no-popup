@@ -42,6 +42,7 @@ import com.habitrpg.android.habitica.data.ChallengeRepository
 import com.habitrpg.android.habitica.data.SocialRepository
 import com.habitrpg.android.habitica.data.TagRepository
 import com.habitrpg.android.habitica.data.TaskRepository
+import com.habitrpg.android.habitica.data.sync.canQueueOfflineTodoOperation
 import com.habitrpg.android.habitica.databinding.ActivityTaskFormBinding
 import com.habitrpg.android.habitica.extensions.OnChangeTextWatcher
 import com.habitrpg.android.habitica.extensions.addCancelButton
@@ -51,6 +52,7 @@ import com.habitrpg.android.habitica.helpers.notifications.PushNotificationManag
 import com.habitrpg.android.habitica.models.Tag
 import com.habitrpg.android.habitica.models.members.Member
 import com.habitrpg.android.habitica.models.social.Challenge
+import com.habitrpg.android.habitica.models.tasks.ChecklistItem
 import com.habitrpg.android.habitica.models.tasks.RemindersItem
 import com.habitrpg.android.habitica.models.tasks.Task
 import com.habitrpg.android.habitica.models.tasks.TaskGroupPlan
@@ -287,8 +289,8 @@ class TaskFormActivity : BaseActivity() {
                     val task =
                         taskRepository.getUnmanagedTask(taskId).firstOrNull() ?: return@launch
                     if (!task.isValid) return@launch
+                    initialTaskInstance = task.copyForEditBaseline()
                     this@TaskFormActivity.task = task
-                    initialTaskInstance = task
                     fillForm(task)
                     task.challengeID?.let { challengeID ->
                         lifecycleScope.launch(Dispatchers.Main) {
@@ -313,7 +315,10 @@ class TaskFormActivity : BaseActivity() {
                         @Suppress("DEPRECATION")
                         bundle.getParcelable(PARCELABLE_TASK)
                     }
-                task?.let { fillForm(it) }
+                task?.let {
+                    initialTaskInstance = it.copyForEditBaseline()
+                    fillForm(it)
+                }
             }
 
             else -> {
@@ -803,6 +808,12 @@ class TaskFormActivity : BaseActivity() {
         }
         isSaving = true
         var thisTask = task
+        val editBaseline =
+            if (isCreating) {
+                null
+            } else {
+                initialTaskInstance
+            }
         if (thisTask == null) {
             thisTask = Task()
             thisTask.type = taskType
@@ -842,19 +853,33 @@ class TaskFormActivity : BaseActivity() {
         }
 
         if (!isChallengeTask) {
-            val refreshWidgets: suspend () -> Unit = {
+            val deferTodoAlarms = thisTask.canQueueOfflineTodoOperation()
+            val completeSave: suspend (Task) -> Unit = { savedTask ->
                 WidgetRefreshWorker.refreshTaskListWidgetsNow(applicationContext)
+                if (deferTodoAlarms) {
+                    taskAlarmManager.cancelRemovedRemindersAlarms(
+                        oldReminders = originalReminders,
+                        newReminders = savedTask.reminders ?: emptyList(),
+                    )
+                    taskAlarmManager.scheduleAlarmsForTask(savedTask)
+                }
             }
             if (isCreating) {
-                taskRepository.createTaskInBackground(thisTask, assignChanges, refreshWidgets)
+                taskRepository.createTaskInBackground(thisTask, assignChanges, completeSave)
             } else {
-                taskRepository.updateTaskInBackground(thisTask, assignChanges, refreshWidgets)
+                taskRepository.updateTaskInBackground(
+                    thisTask,
+                    assignChanges,
+                    completeSave,
+                    editBaseline,
+                )
             }
-
-            if (thisTask.type == TaskType.DAILY || thisTask.type == TaskType.TODO) {
+            if (!deferTodoAlarms &&
+                (thisTask.type == TaskType.DAILY || thisTask.type == TaskType.TODO)
+            ) {
                 taskAlarmManager.cancelRemovedRemindersAlarms(
                     oldReminders = originalReminders,
-                    newReminders = thisTask.reminders ?: emptyList()
+                    newReminders = thisTask.reminders ?: emptyList(),
                 )
                 taskAlarmManager.scheduleAlarmsForTask(thisTask)
             }
@@ -870,6 +895,56 @@ class TaskFormActivity : BaseActivity() {
             },
             500
         )
+    }
+
+    /** Returns an independent snapshot before form controls mutate nested task values. */
+    private fun Task.copyForEditBaseline(): Task {
+        val source = this
+        return Task().apply {
+            ownerID = source.ownerID
+            id = source.id
+            alias = source.alias
+            type = source.type
+
+            text = source.text
+            notes = source.notes
+            priority = source.priority
+            attribute = source.attribute
+            tags = source.tags?.let { sourceTags ->
+                RealmList<Tag>().apply {
+                    sourceTags.forEach { sourceTag ->
+                        add(
+                            Tag().apply {
+                                id = sourceTag.id
+                                userId = sourceTag.userId
+                                name = sourceTag.name
+                                group = sourceTag.group
+                            }
+                        )
+                    }
+                }
+            }
+            dueDate = source.dueDate?.let { Date(it.time) }
+            checklist = source.checklist?.let { sourceChecklist ->
+                RealmList<ChecklistItem>().apply {
+                    sourceChecklist.forEach { add(ChecklistItem(it)) }
+                }
+            }
+            reminders = source.reminders?.let { sourceReminders ->
+                RealmList<RemindersItem>().apply {
+                    sourceReminders.forEach { sourceReminder ->
+                        add(
+                            RemindersItem().apply {
+                                id = sourceReminder.id
+                                startDate = sourceReminder.startDate
+                                time = sourceReminder.time
+                                type = sourceReminder.type
+                            }
+                        )
+                    }
+                }
+            }
+        }
     }
 
     private fun deleteTask() {

@@ -14,7 +14,7 @@ abstract class BaseRepositoryImpl<T : BaseLocalRepository>(
     val currentUserID: String
         get() = authenticationHandler.currentUserID ?: ""
 
-    override fun close() {
+    open override fun close() {
         this.localRepository.close()
     }
 

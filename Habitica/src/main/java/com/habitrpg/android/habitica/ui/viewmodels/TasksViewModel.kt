@@ -123,15 +123,21 @@ constructor(
         onResult: (TaskScoringResult, Int) -> Unit
     ) {
         viewModelScope.launch(ExceptionHandler.coroutine()) {
-            if (task.type == TaskType.TODO && direction == TaskDirection.UP && task.reminders?.isNotEmpty() == true) {
-                taskAlarmManager.removeAlarmsForTask(task)
-            }
+            var accepted = false
             taskRepository.taskChecked(
                 null,
                 task.id ?: "",
                 direction == TaskDirection.UP,
                 false
             ) { result ->
+                accepted = true
+                if (task.type == TaskType.TODO && task.reminders?.isNotEmpty() == true) {
+                    if (direction == TaskDirection.UP) {
+                        taskAlarmManager.removeAlarmsForTask(task)
+                    } else {
+                        taskAlarmManager.scheduleAlarmsForTask(task)
+                    }
+                }
                 onResult(result, task.value.toInt())
                 if (!DateUtils.isToday(sharedPreferences.getLong("last_task_reporting", 0))) {
                     Analytics.sendEvent(
@@ -144,7 +150,9 @@ constructor(
                     }
                 }
             }
-            applyInAppScoreToWidgets(context, task.id ?: "", direction == TaskDirection.UP)
+            if (accepted) {
+                applyInAppScoreToWidgets(context, task.id ?: "", direction == TaskDirection.UP)
+            }
         }
     }
 

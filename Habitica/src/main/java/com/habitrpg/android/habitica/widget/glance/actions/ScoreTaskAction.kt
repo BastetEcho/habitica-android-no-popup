@@ -23,8 +23,6 @@ class ScoreTaskAction : ActionCallback {
         val direction = parameters[WidgetActionKeys.direction] ?: TaskDirection.UP.text
         val up = direction == TaskDirection.UP.text
 
-        if (up) WidgetSnapshotPublisher.optimisticComplete(context, taskId)
-
         val entry = widgetEntryPoint(context)
         val result: TaskScoringResult? = withContext(Dispatchers.Main) {
             val user = entry.userRepository().getUser().firstOrNull()
@@ -37,7 +35,9 @@ class ScoreTaskAction : ActionCallback {
             )
         }
 
-        showScoringToast(context, result)
-        WidgetSnapshotPublisher.publishAll(context)
+        if (result != null) {
+            showScoringToast(context, result)
+            WidgetSnapshotPublisher.publishAll(context)
+        }
     }
 }

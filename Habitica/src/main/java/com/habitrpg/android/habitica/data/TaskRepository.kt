@@ -60,7 +60,17 @@ interface TaskRepository : BaseRepository {
 
     fun getTask(taskId: String): Flow<Task>
 
+    fun getTask(
+        taskId: String,
+        ownerID: String,
+    ): Flow<Task>
+
     fun getTaskCopy(taskId: String): Flow<Task>
+
+    fun getTaskCopy(
+        taskId: String,
+        ownerID: String,
+    ): Flow<Task>
 
     suspend fun createTask(
         task: Task,
@@ -69,7 +79,8 @@ interface TaskRepository : BaseRepository {
 
     suspend fun updateTask(
         task: Task,
-        force: Boolean = false
+        force: Boolean = false,
+        editBaseline: Task? = null,
     ): Task?
 
     suspend fun deleteTask(taskId: String): Boolean
@@ -104,13 +115,14 @@ interface TaskRepository : BaseRepository {
     fun updateTaskInBackground(
         task: Task,
         assignChanges: Map<String, MutableList<String>>,
-        onComplete: (suspend () -> Unit)? = null
+        onComplete: (suspend (Task) -> Unit)? = null,
+        editBaseline: Task? = null,
     )
 
     fun createTaskInBackground(
         task: Task,
         assignChanges: Map<String, MutableList<String>>,
-        onComplete: (suspend () -> Unit)? = null
+        onComplete: (suspend (Task) -> Unit)? = null
     )
 
     fun getTaskCopies(): Flow<List<Task>>
@@ -123,7 +135,34 @@ interface TaskRepository : BaseRepository {
 
     suspend fun syncErroredTasks(): List<Task>?
 
-    suspend fun syncPendingTaskCreations(): Boolean
+    fun currentUserIDForSync(): String
+
+    suspend fun syncPendingTaskCreations(
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
+    ): Boolean
+
+    suspend fun getPendingTodoScoreRefreshes(
+        expectedUserID: String? = null,
+        expectedServerOrigin: String? = null,
+    ): List<Task>
+
+    suspend fun getTodoCopiesForSync(
+        expectedUserID: String,
+        expectedServerOrigin: String? = null,
+    ): List<Task>
+
+    suspend fun refreshPendingTodoScoreTasks(
+        tasks: List<Task>,
+        expectedUserID: String,
+        expectedServerOrigin: String? = null,
+    ): List<Task>
+
+    suspend fun clearPendingTodoScoreRefreshes(
+        expectedUserID: String,
+        refreshedTasks: List<Task>,
+        expectedServerOrigin: String? = null,
+    )
 
     suspend fun unlinkAllTasks(
         challengeID: String?,

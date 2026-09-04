@@ -21,7 +21,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.flow.filter
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import java.time.DateTimeException
@@ -37,7 +36,6 @@ class TaskAlarmManager(
     private var authenticationHandler: AuthenticationHandler
 ) {
     private val am: AlarmManager? = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
-    private val upcomingReminderOccurrencesToSchedule = 3
 
     /**
      * Schedules multiple alarms for each reminder associated with a given task.
@@ -58,26 +56,29 @@ class TaskAlarmManager(
      */
     private fun setAlarmsForTask(task: Task) {
         CoroutineScope(Dispatchers.IO).launch {
-            val reminderOccurencesToSchedule =
-                if (task.type == TaskType.TODO) {
-                    1
-                } else {
-                    // For dailies, we schedule multiple reminders in advance
-                    upcomingReminderOccurrencesToSchedule
-                }
-            task.reminders?.let { reminders ->
-                for (reminder in reminders) {
-                    try {
-                        val upcomingReminders =
-                            task.getNextReminderOccurrences(reminder, reminderOccurencesToSchedule)
-                        upcomingReminders?.forEachIndexed { index, reminderNextOccurrenceTime ->
-                            reminder?.time =
-                                reminderNextOccurrenceTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)
-                            setAlarmForRemindersItem(task, reminder, index)
-                        }
-                    } catch (_: DateTimeException) {
-                        // code accidentally generated an invalid date
+            setAlarmsForTaskNow(task)
+        }
+    }
+
+    fun setAlarmsForTaskNow(task: Task) {
+        val reminderOccurencesToSchedule =
+            if (task.type == TaskType.TODO) {
+                1
+            } else {
+                UPCOMING_REMINDER_OCCURRENCES_TO_SCHEDULE
+            }
+        task.reminders?.let { reminders ->
+            for (reminder in reminders) {
+                try {
+                    val upcomingReminders =
+                        task.getNextReminderOccurrences(reminder, reminderOccurencesToSchedule)
+                    upcomingReminders?.forEachIndexed { index, reminderNextOccurrenceTime ->
+                        reminder?.time =
+                            reminderNextOccurrenceTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+                        setAlarmForRemindersItem(task, reminder, index)
                     }
+                } catch (_: DateTimeException) {
+                    // Ignore an invalid reminder generated from malformed task data.
                 }
             }
         }
@@ -96,24 +97,31 @@ class TaskAlarmManager(
 
     fun removeAlarmsForTask(task: Task) {
         CoroutineScope(Dispatchers.IO).launchCatching {
-            task.reminders?.let { reminders ->
-                // Remove not only the immediate reminder, but also the next however many (upcomingReminderOccurrencesToSchedule) reminders
-                reminders.forEachIndexed { index, reminder ->
-                    removeAlarmForRemindersItem(reminder, index)
-                }
-            }
+            removeAlarmsForTaskNow(task)
         }
+    }
+
+    fun removeAlarmsForTaskNow(task: Task) {
+        cancelAlarmsForTasks(context, listOf(task))
     }
 
     // This function is used from the TaskReceiver since we do not have access to the task
     // We currently only use this function to schedule the next reminder for dailies
     // We may be able to use repeating alarms instead of this in the future
-    fun addAlarmForTaskId(taskId: String) {
+    fun addAlarmForTaskId(
+        taskId: String,
+        expectedUserID: String = authenticationHandler.currentUserID.orEmpty(),
+    ) {
+        if (expectedUserID.isBlank()) return
         MainScope().launch(ExceptionHandler.coroutine()) {
+            if (authenticationHandler.currentUserID != expectedUserID) return@launch
             val task =
-                taskRepository.getTaskCopy(taskId)
-                    .filter { task -> task.isValid && task.isManaged && TaskType.DAILY == task.type }
-                    .first()
+                taskRepository.getTaskCopy(taskId, expectedUserID)
+                    .filter { task ->
+                        task.isValid && task.isManaged && TaskType.DAILY == task.type
+                    }
+                    .firstOrNull() ?: return@launch
+            if (authenticationHandler.currentUserID != expectedUserID) return@launch
             setAlarmsForTask(task)
         }
     }
@@ -192,9 +200,7 @@ class TaskAlarmManager(
                 PendingIntent.FLAG_UPDATE_CURRENT + PendingIntent.FLAG_IMMUTABLE
             )
 
-        CoroutineScope(Dispatchers.IO).launch {
-            setAlarm(context, reminderZonedTime.toEpochMilli(), sender)
-        }
+        setAlarm(context, reminderZonedTime.toEpochMilli(), sender)
     }
 
     private fun removeAlarmForRemindersItem(
@@ -228,8 +234,51 @@ class TaskAlarmManager(
     }
 
     companion object {
+        private const val UPCOMING_REMINDER_OCCURRENCES_TO_SCHEDULE = 3
+
         const val TASK_ID_INTENT_KEY = "TASK_ID"
         const val TASK_NAME_INTENT_KEY = "TASK_NAME"
+
+        /** Cancels every scheduled task-reminder occurrence for detached task snapshots. */
+        internal fun cancelAlarmsForTasks(
+            context: Context,
+            tasks: Collection<Task>,
+        ) {
+            tasks.forEach { task ->
+                val occurrenceCount =
+                    if (task.type == TaskType.TODO) {
+                        1
+                    } else {
+                        UPCOMING_REMINDER_OCCURRENCES_TO_SCHEDULE
+                    }
+                task.reminders.orEmpty().forEach { reminder ->
+                    repeat(occurrenceCount) { occurrenceIndex ->
+                        cancelReminderAlarm(context, reminder, occurrenceIndex)
+                    }
+                }
+            }
+        }
+
+        private fun cancelReminderAlarm(
+            context: Context,
+            remindersItem: RemindersItem,
+            occurrenceIndex: Int,
+        ) {
+            val intent = Intent(context, TaskReceiver::class.java).apply {
+                action = remindersItem.id
+            }
+            val intentId = (remindersItem.id?.hashCode() ?: 0) + occurrenceIndex
+            val sender =
+                PendingIntent.getBroadcast(
+                    context,
+                    intentId,
+                    intent,
+                    PendingIntent.FLAG_NO_CREATE + PendingIntent.FLAG_IMMUTABLE,
+                ) ?: return
+            sender.cancel()
+            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+            alarmManager?.cancel(sender)
+        }
 
         fun scheduleDailyReminder(context: Context?) {
             if (context == null) return

@@ -251,7 +251,12 @@ abstract class BaseTaskViewHolder(
 
         val isQueuedOffline =
             task?.let {
-                (it.pendingCreate || it.pendingDelete || it.pendingPosition || it.pendingScoreUp) &&
+                (
+                    it.pendingCreate || it.pendingDelete || it.pendingDeleteAfterScore ||
+                        it.pendingUpdate ||
+                        it.pendingPosition || it.pendingScoreUp || it.pendingScoreDown ||
+                        it.pendingScoreRefresh || it.pendingChecklist
+                ) &&
                     it.canQueueOfflineCreation()
             } == true
         syncingView?.visibility =

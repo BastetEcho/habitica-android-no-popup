@@ -17,6 +17,7 @@ import androidx.recyclerview.widget.RecyclerView.NO_POSITION
 import com.habitrpg.android.habitica.R
 import com.habitrpg.android.habitica.data.InventoryRepository
 import com.habitrpg.android.habitica.data.TaskRepository
+import com.habitrpg.android.habitica.data.sync.hasPendingTodoScore
 import com.habitrpg.android.habitica.data.UserRepository
 import com.habitrpg.android.habitica.databinding.FragmentRefreshRecyclerviewBinding
 import com.habitrpg.android.habitica.databinding.FragmentTasksRecyclerviewBinding
@@ -151,9 +152,9 @@ open class TaskRecyclerViewFragment :
         recyclerAdapter?.taskOpenEvents = { task, _ ->
             openTaskForm(task)
         }
-        recyclerAdapter?.taskScoreEvents = { task, direction ->
+        recyclerAdapter?.taskScoreEvents = scoreEvent@{ task, direction ->
+            if (task.hasPendingTodoScore()) return@scoreEvent
             playSound(direction)
-            context?.let { it1 -> notificationsManager.dismissTaskNotification(it1, task) }
             scoreTask(task, direction)
         }
         recyclerAdapter?.checklistItemScoreEvents = { task, item ->
@@ -212,7 +213,9 @@ open class TaskRecyclerViewFragment :
     }
 
     private fun playSound(direction: TaskDirection) {
-        HapticFeedbackManager.tap(requireView())
+        if (taskType != TaskType.TODO) {
+            HapticFeedbackManager.tap(requireView())
+        }
         val soundName =
             when (taskType) {
                 TaskType.HABIT -> if (direction == TaskDirection.UP) SoundManager.SOUND_PLUS_HABIT else SoundManager.SOUND_MINUS_HABIT
@@ -546,6 +549,9 @@ open class TaskRecyclerViewFragment :
         direction: TaskDirection
     ) {
         viewModel.scoreTask(task, direction) { result, value ->
+            if (direction == TaskDirection.UP) {
+                context?.let { notificationsManager.dismissTaskNotification(it, task) }
+            }
             handleTaskResult(result, value)
         }
     }

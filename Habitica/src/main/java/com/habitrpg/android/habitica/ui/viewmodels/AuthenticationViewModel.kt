@@ -23,6 +23,7 @@ import com.google.android.libraries.identity.googleid.GoogleIdTokenParsingExcept
 import com.habitrpg.android.habitica.BuildConfig
 import com.habitrpg.android.habitica.data.ApiClient
 import com.habitrpg.android.habitica.data.UserRepository
+import com.habitrpg.android.habitica.data.sync.OfflineTaskSyncScheduler
 import com.habitrpg.android.habitica.extensions.AuthenticationErrors
 import com.habitrpg.android.habitica.helpers.Analytics
 import com.habitrpg.android.habitica.helpers.AnalyticsTarget
@@ -57,6 +58,7 @@ class AuthenticationViewModel @Inject constructor(
     val configManager: AppConfigManager,
     val hostConfig: HostConfig,
     private val keyHelper: KeyHelper?,
+    private val offlineTaskSyncScheduler: OfflineTaskSyncScheduler,
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
     val email = mutableStateOf("")
@@ -207,6 +209,7 @@ class AuthenticationViewModel @Inject constructor(
     ) {
         this.apiClient.updateAuthenticationCredentials(user, api)
         authenticationHandler.updateUserID(user)
+        offlineTaskSyncScheduler.enqueue(user, replaceExisting = true)
         sharedPrefs.edit {
             putString("UserID", user)
             val encryptedKey =

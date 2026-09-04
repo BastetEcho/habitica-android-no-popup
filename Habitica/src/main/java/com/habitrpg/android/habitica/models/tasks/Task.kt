@@ -32,9 +32,9 @@ open class Task : RealmObject, BaseMainObject, Parcelable, BaseTask {
     override val realmClass: Class<Task>
         get() = Task::class.java
     override val primaryIdentifier: String?
-        get() = id
+        get() = combinedID
     override val primaryIdentifierName: String
-        get() = "id"
+        get() = "combinedID"
 
     @PrimaryKey
     var combinedID: String? = null
@@ -125,8 +125,20 @@ open class Task : RealmObject, BaseMainObject, Parcelable, BaseTask {
     var isCreating: Boolean = false
     var pendingCreate: Boolean = false
     var pendingDelete: Boolean = false
+    var pendingDeleteAfterScore: Boolean = false
+    var pendingUpdate: Boolean = false
+    var pendingEditFields: String? = null
     var pendingPosition: Boolean = false
     var pendingScoreUp: Boolean = false
+    var pendingScoreDown: Boolean = false
+    var pendingScoreSnapshot: String? = null
+    var pendingScoreRefresh: Boolean = false
+    var pendingChecklist: Boolean = false
+    var outboxServerOrigin: String? = null
+
+    @Ignore
+    var missingDuringScoreRefresh: Boolean = false
+
     var yesterDaily: Boolean = true
 
     var daysOfMonthString: String? = null
