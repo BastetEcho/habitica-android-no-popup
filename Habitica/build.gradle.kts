@@ -229,6 +229,8 @@ dependencies {
 
     //Tests
     testImplementation(libs.bundles.test.implementation)
+    // MockK reflects Realm's optional RxJava API when instrumenting database classes.
+    testRuntimeOnly(libs.rxjava2)
     androidTestImplementation(libs.bundles.android.test.implementation)
     androidTestImplementation(libs.kaspresso) { exclude(module = "protobuf-lite") }
     debugImplementation(libs.test.fragment)

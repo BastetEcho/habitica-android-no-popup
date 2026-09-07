@@ -34,6 +34,15 @@ Do not uninstall the app or clear its storage while pending work needs recovery.
 The new offline implementation must provide an explicitly tested import of that
 preserved work, not silently assume every old task exists on the server.
 
+## Baseline verification
+
+The focused production-debug unit run passes all ten tests: nine repository
+tests and one legacy-worker test. The repository tests include an identity
+assertion that queryable Realm task results reach the list adapter unchanged.
+Realm's optional RxJava types are included only in the unit-test runtime so
+MockK can instrument database classes; this adds no APK runtime dependency.
+On-device database preservation and a signed release APK remain separate checks.
+
 ## Replacement acceptance criteria
 
 Implement personal Todos first. Keep network operations in a dedicated durable
