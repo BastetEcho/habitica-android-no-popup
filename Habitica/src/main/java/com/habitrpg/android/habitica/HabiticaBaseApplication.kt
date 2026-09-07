@@ -246,6 +246,8 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
         Realm.init(this)
         val builder =
             RealmConfiguration.Builder()
+                // Keep the previous offline outbox in its original Realm for later recovery.
+                .name("baseline-rc3.realm")
                 .schemaVersion(1)
                 .deleteRealmIfMigrationNeeded()
                 .allowWritesOnUiThread(true)
