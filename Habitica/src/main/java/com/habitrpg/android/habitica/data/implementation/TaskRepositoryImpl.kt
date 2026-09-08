@@ -3,6 +3,11 @@ package com.habitrpg.android.habitica.data.implementation
 import com.habitrpg.android.habitica.data.ApiClient
 import com.habitrpg.android.habitica.data.TaskRepository
 import com.habitrpg.android.habitica.data.local.TaskLocalRepository
+import com.google.gson.JsonObject
+import com.google.gson.JsonArray
+import com.habitrpg.android.habitica.data.sync.TodoOperationType
+import com.habitrpg.android.habitica.data.sync.TodoOutbox
+import com.habitrpg.android.habitica.data.sync.TodoTaskOrdering
 import com.habitrpg.android.habitica.helpers.Analytics
 import com.habitrpg.android.habitica.helpers.AppConfigManager
 import com.habitrpg.android.habitica.helpers.EventCategory
@@ -31,6 +36,7 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
+import java.io.IOException
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
@@ -41,7 +47,8 @@ class TaskRepositoryImpl(
     localRepository: TaskLocalRepository,
     apiClient: ApiClient,
     authenticationHandler: AuthenticationHandler,
-    val appConfigManager: AppConfigManager
+    val appConfigManager: AppConfigManager,
+    private val todoOutbox: TodoOutbox? = null
 ) : BaseRepositoryImpl<TaskLocalRepository>(localRepository, apiClient, authenticationHandler),
     TaskRepository {
     private var lastTaskAction: Long = 0
@@ -51,6 +58,8 @@ class TaskRepositoryImpl(
         if (r.isClosed) return
         try {
             r.refresh()
+            restorePendingTodos()
+            todoOutbox?.resume()
         } catch (_: IllegalStateException) {
         }
     }
@@ -59,19 +68,26 @@ class TaskRepositoryImpl(
         taskType: TaskType,
         userID: String?,
         includedGroupIDs: Array<String>
-    ): Flow<List<Task>> =
-        this.localRepository.getTasks(
+    ): Flow<List<Task>> {
+        restorePendingTodos()
+        todoOutbox?.resume()
+        return this.localRepository.getTasks(
             taskType,
             userID ?: authenticationHandler.currentUserID ?: "",
             includedGroupIDs
         )
+    }
 
     override fun saveTasks(
         userId: String,
         order: TasksOrder,
         tasks: TaskList
     ) {
+        if (!isCurrentTaskRead(tasks)) return
+        if (todoOutbox?.scope()?.userId == userId) mergePendingTodos(tasks)
         localRepository.saveTasks(userId, order, tasks)
+        restorePendingTodos()
+        todoOutbox?.resume()
     }
 
     override suspend fun retrieveTasks(
@@ -79,17 +95,23 @@ class TaskRepositoryImpl(
         tasksOrder: TasksOrder
     ): TaskList? {
         val tasks = apiClient.getTasks() ?: return null
-        this.localRepository.saveTasks(userId, tasksOrder, tasks)
+        if (!isCurrentTaskRead(tasks)) return null
+        saveTasks(userId, tasksOrder, tasks)
         return tasks
     }
 
     override suspend fun retrieveCompletedTodos(userId: String?): TaskList? {
         val taskList = this.apiClient.getTasks("completedTodos") ?: return null
+        if (!isCurrentTaskRead(taskList)) return null
+        if (todoOutbox?.scope()?.userId == (userId ?: authenticationHandler.currentUserID)) {
+            mergePendingTodos(taskList, completedOnly = true)
+        }
         val tasks = taskList.tasks
         this.localRepository.saveCompletedTodos(
             userId ?: authenticationHandler.currentUserID ?: "",
             tasks.values
         )
+        restorePendingTodos()
         return taskList
     }
 
@@ -100,7 +122,8 @@ class TaskRepositoryImpl(
     ): TaskList? {
         val formatter = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZZZZZ", Locale.US)
         val taskList = this.apiClient.getTasks("dailys", formatter.format(dueDate)) ?: return null
-        this.localRepository.saveTasks(userId, tasksOrder, taskList)
+        if (!isCurrentTaskRead(taskList)) return null
+        saveTasks(userId, tasksOrder, taskList)
         return taskList
     }
 
@@ -112,6 +135,15 @@ class TaskRepositoryImpl(
         force: Boolean,
         notifyFunc: ((TaskScoringResult) -> Unit)?
     ): TaskScoringResult? {
+        if (todoOutbox?.handles(task) == true) {
+            val local = localRepository.getUnmanagedCopy(task)
+            if (local.completed == up) return null
+            local.completed = up
+            todoOutbox.enqueue(local, TodoOperationType.SCORE, JsonObject().apply { addProperty("up", up) })
+            restorePendingTodos()
+            // The initiating view already plays its sound. Stats, quests, and callbacks wait for the server.
+            return null
+        }
         val localData =
             if (user != null && appConfigManager.enableLocalTaskScoring()) {
                 ScoreTaskLocallyInteractor.score(
@@ -295,7 +327,7 @@ class TaskRepositoryImpl(
         force: Boolean,
         notifyFunc: ((TaskScoringResult) -> Unit)?
     ): TaskScoringResult? {
-        val task = localRepository.getTask(taskId).firstOrNull() ?: return null
+        val task = getTask(taskId).firstOrNull() ?: return null
         return taskChecked(user, task, up, force, notifyFunc)
     }
 
@@ -303,6 +335,17 @@ class TaskRepositoryImpl(
         taskId: String,
         itemId: String
     ): Task? {
+        val localTask = pendingEligibleTask(taskId)
+        if (localTask != null) {
+            val item = localTask.checklist?.firstOrNull { it.id == itemId } ?: return localTask
+            item.completed = !item.completed
+            todoOutbox?.enqueue(localTask, TodoOperationType.CHECKLIST, JsonObject().apply {
+                addProperty("itemId", itemId)
+                addProperty("completed", item.completed)
+            })
+            restorePendingTodos()
+            return localTask
+        }
         val task = apiClient.scoreChecklistItem(taskId, itemId)
         val updatedItem: ChecklistItem? = task?.checklist?.lastOrNull { itemId == it.id }
         if (updatedItem != null) {
@@ -311,14 +354,20 @@ class TaskRepositoryImpl(
         return task
     }
 
-    override fun getTask(taskId: String) = localRepository.getTask(taskId)
+    override fun getTask(taskId: String) = localRepository.getTask(todoOutbox?.resolve(taskId) ?: taskId)
 
-    override fun getTaskCopy(taskId: String) = localRepository.getTaskCopy(taskId)
+    override fun getTaskCopy(taskId: String) = localRepository.getTaskCopy(todoOutbox?.resolve(taskId) ?: taskId)
 
     override suspend fun createTask(
         task: Task,
         force: Boolean
     ): Task? {
+        if (todoOutbox?.handles(task) == true) {
+            val local = localRepository.getUnmanagedCopy(task)
+            todoOutbox.enqueue(local, TodoOperationType.CREATE)
+            restorePendingTodos()
+            return local
+        }
         val now = Date().time
         if (lastTaskAction > now - 500 && !force) {
             return null
@@ -362,6 +411,17 @@ class TaskRepositoryImpl(
         task: Task,
         force: Boolean
     ): Task? {
+        if (todoOutbox?.handles(task) == true) {
+            val local = localRepository.getUnmanagedCopy(task)
+            task.id?.let(::pendingEligibleTask)?.let { current ->
+                local.completed = current.completed
+                local.position = current.position
+                local.value = current.value
+            }
+            todoOutbox.enqueue(local, TodoOperationType.UPDATE)
+            restorePendingTodos()
+            return local
+        }
         val now = Date().time
         if ((lastTaskAction > now - 500 && !force) || !task.isValid) {
             return task
@@ -388,6 +448,12 @@ class TaskRepositoryImpl(
     }
 
     override suspend fun deleteTask(taskId: String): Void? {
+        val localTask = pendingEligibleTask(taskId)
+        if (localTask != null) {
+            todoOutbox?.enqueue(localTask, TodoOperationType.DELETE)
+            restorePendingTodos()
+            return null
+        }
         apiClient.deleteTask(taskId) ?: return null
         localRepository.deleteTask(taskId)
         return null
@@ -397,7 +463,12 @@ class TaskRepositoryImpl(
         localRepository.save(task)
     }
 
-    override suspend fun createTasks(newTasks: List<Task>) = apiClient.createTasks(newTasks)
+    override suspend fun createTasks(newTasks: List<Task>): List<Task>? {
+        if (newTasks.any { todoOutbox?.handles(it) == true }) {
+            return newTasks.mapNotNull { createTask(it, force = true) }
+        }
+        return apiClient.createTasks(newTasks)
+    }
 
     override fun markTaskCompleted(
         taskId: String,
@@ -425,6 +496,28 @@ class TaskRepositoryImpl(
         taskID: String,
         newPosition: Int
     ): List<String>? {
+        val localTask = pendingEligibleTask(taskID)
+        if (localTask != null) {
+            // Completed Todos are not members of the server's active Todo order.
+            if (localTask.completed) return null
+            val outbox = requireNotNull(todoOutbox)
+            val owner = requireNotNull(outbox.scope()).userId
+            val currentOrder = localRepository.realm.where(Task::class.java)
+                .equalTo("ownerID", owner).equalTo("typeValue", TaskType.TODO.value)
+                .equalTo("completed", false)
+                .sort("position", io.realm.Sort.ASCENDING, "dateCreated", io.realm.Sort.DESCENDING)
+                .findAll().filterNot { it.isGroupTask }.mapNotNull { it.id }.map(outbox::resolve).distinct()
+            val projectedOrder = outbox.pendingOrder(currentOrder) ?: currentOrder
+            val taskId = outbox.resolve(requireNotNull(localTask.id))
+            val order = TodoTaskOrdering.move(projectedOrder, taskId, newPosition)
+            localTask.position = order.indexOf(taskId)
+            outbox.enqueue(localTask, TodoOperationType.MOVE, JsonObject().apply {
+                addProperty("position", newPosition)
+                add(TodoTaskOrdering.LOCAL_ORDER, JsonArray().apply { order.forEach { add(it) } })
+            })
+            restorePendingTodos()
+            return order
+        }
         val task = getTask(taskID).firstOrNull()
         val positions = if (task?.isGroupTask == true) {
             apiClient.postGroupTaskNewPosition(taskID, newPosition)
@@ -513,6 +606,7 @@ class TaskRepositoryImpl(
     }
 
     override suspend fun syncErroredTasks(): List<Task>? {
+        todoOutbox?.resume()
         val tasks = localRepository.getErroredTasks(currentUserID).firstOrNull()
         return tasks?.map { localRepository.getUnmanagedCopy(it) }?.mapNotNull {
             if (it.isCreating) {
@@ -532,5 +626,98 @@ class TaskRepositoryImpl(
 
     override fun getTasksForChallenge(challengeID: String?): Flow<List<Task>> {
         return localRepository.getTasksForChallenge(challengeID, currentUserID)
+    }
+
+    /** Finds only the signed-in account's personal task and detaches it from Realm before queuing. */
+    private fun pendingEligibleTask(taskId: String): Task? {
+        val outbox = todoOutbox ?: return null
+        val scope = outbox.scope() ?: return null
+        val task = localRepository.realm.where(Task::class.java)
+            .equalTo("id", outbox.resolve(taskId)).equalTo("ownerID", scope.userId).findFirst()
+            ?: localRepository.realm.where(Task::class.java)
+                .equalTo("id", taskId).equalTo("ownerID", scope.userId).findFirst()
+            ?: return null
+        return if (outbox.handles(task)) localRepository.getUnmanagedCopy(task) else null
+    }
+
+    /** Rejects reads that started before a newer local mutation or acknowledged server result. */
+    private fun isCurrentTaskRead(tasks: TaskList): Boolean =
+        tasks.readGeneration?.let { it == apiClient.taskReadGeneration } ?: true
+
+    /** Adds pending records before cache reconciliation so refresh cannot discard local edits. */
+    private fun mergePendingTodos(tasks: TaskList, completedOnly: Boolean = false) {
+        todoOutbox?.projections()?.forEach { (localId, task) ->
+            tasks.tasks.remove(localId)
+            tasks.tasks.remove(todoOutbox.resolve(localId))
+            if (task != null && (!completedOnly || task.completed)) {
+                tasks.tasks[requireNotNull(task.id)] = task
+            }
+        }
+    }
+
+    /** Materializes durable local truth without converting the adapter's RealmResults to a List. */
+    private fun restorePendingTodos(acknowledgingSequence: Long? = null) {
+        val outbox = todoOutbox ?: return
+        val scope = outbox.scope() ?: return
+        val projections = outbox.projections(acknowledgingSequence)
+        if (localRepository.isClosed) return
+        localRepository.executeTransaction { realm ->
+            projections.forEach { (localId, task) ->
+                val serverId = outbox.resolve(localId)
+                if (task == null || localId != serverId) {
+                    realm.where(Task::class.java).equalTo("ownerID", scope.userId)
+                        .equalTo("id", localId).findAll().deleteAllFromRealm()
+                }
+                if (task == null) {
+                    realm.where(Task::class.java).equalTo("ownerID", scope.userId)
+                        .equalTo("id", serverId).findAll().deleteAllFromRealm()
+                } else realm.insertOrUpdate(task)
+            }
+            val personalTodos = realm.where(Task::class.java)
+                .equalTo("ownerID", scope.userId).equalTo("typeValue", TaskType.TODO.value)
+                .equalTo("completed", false)
+                .sort("position", io.realm.Sort.ASCENDING, "dateCreated", io.realm.Sort.DESCENDING)
+                .findAll().filterNot { it.isGroupTask }
+            val order = outbox.pendingOrder(personalTodos.mapNotNull { it.id }, acknowledgingSequence)
+            if (order != null) {
+                val positions = order.withIndex().associate { it.value to it.index }
+                personalTodos.forEach { task -> positions[task.id]?.let { task.position = it } }
+            }
+        }
+    }
+
+    /** Applies checkpointed replies silently, then reconciles canonical server account data. */
+    override suspend fun syncPendingTodos(): Boolean {
+        val outbox = todoOutbox ?: return true
+        val scope = outbox.scope() ?: return true
+        restorePendingTodos()
+        val drained = outbox.replay { operation, reply ->
+            val local = pendingEligibleTask(operation.taskId)
+            reply.snapshot?.let { snapshot ->
+                val serverTask = outbox.codec.restore(snapshot)
+                local?.let { serverTask.position = it.position; serverTask.tags = it.tags }
+                localRepository.save(serverTask)
+                if (operation.taskId != serverTask.id) {
+                    localRepository.executeTransaction { realm ->
+                        realm.where(Task::class.java).equalTo("ownerID", scope.userId)
+                            .equalTo("id", operation.taskId).findAll().deleteAllFromRealm()
+                    }
+                }
+            }
+            reply.order?.let { localRepository.updateTaskPositions(it) }
+            if (reply.deleted) {
+                reply.serverId?.let { localRepository.deleteTask(it) }
+            }
+            if (reply.refreshUser) {
+                // Persisted receipt remains pending if this read fails; never apply additive quest/drop effects twice.
+                val user = apiClient.todoRemoteApi.forAccount(scope.server, scope.userId).user()
+                if (outbox.scope() != scope || user.id != scope.userId) {
+                    throw IOException("Todo scoring account changed")
+                }
+                localRepository.save(user)
+            }
+            restorePendingTodos(operation.sequence)
+        }
+        return drained
     }
 }

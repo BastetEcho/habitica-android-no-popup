@@ -63,3 +63,39 @@ Before publishing, verify unchanged filters for Dailies, Habits, and Todos with
 mixed due/not-due and completed/incomplete fixtures, plus tags, search, and date
 ordering. Expand offline support beyond personal Todos only after this behavior
 has been confirmed.
+
+## Replacement design
+
+The replacement stores personal Todo requests and their latest local presentation
+in an app-private SQLite database, independently of Realm. Enqueueing atomically
+saves both records before the UI reports success. A monotonically increasing
+sequence preserves operation order within each account and API server. Request
+bodies never contain authentication credentials; the authenticated transport
+supplies current credentials only when replaying that same account's work.
+
+The UI still receives the original queryable Realm collection. Pending task
+snapshots are materialized into Realm and merged before refresh reconciliation;
+they are not added by wrapping or filtering the list returned to the adapter.
+Personal Todo creates, edits, completion/undo, checklist toggles, moves, and deletes
+use this outbox. Habits, Dailies, and group-task mutations retain their existing
+implementation.
+
+Connected-only WorkManager jobs drain the queue serially. A create uses a stable
+client-generated UUID. Successful responses and any server ID mapping are
+checkpointed before applying them locally, so dependent operations use the
+canonical identity. A retry reconciles uncertain creates and desired completion
+or checklist state before repeating a mutating request. Completion uses the full
+server score endpoint, followed by an authoritative account read; local scoring
+does not synthesize quest progress, drops, or rewards. Replay has no sound or
+notification presentation callbacks.
+
+These safeguards do not constitute a server-side exactly-once guarantee. The
+Habitica API does not provide an atomic idempotency receipt covering task scoring
+and all game effects. Concurrent changes from another client or a partial server
+write can remain ambiguous. Unresolved operations stay persisted rather than
+being discarded or blindly converted into a new task.
+
+New-outbox test results and release validation must be recorded after the focused
+tests and signed build finish. The separate legacy database remains preserved;
+records from releases without reliable server provenance must not be silently
+imported or rescored.

@@ -43,6 +43,11 @@ open class User : RealmObject(), BaseMainObject, Avatar, VersionedObject {
     @Ignore
     var tasks: TaskList? = null
 
+    /** Process-local task/user refresh fence; never stored in Realm or sent to the server. */
+    @Ignore
+    @Transient
+    var taskReadGeneration: Long? = null
+
     @PrimaryKey
     @SerializedName("_id")
     override var id: String? = null

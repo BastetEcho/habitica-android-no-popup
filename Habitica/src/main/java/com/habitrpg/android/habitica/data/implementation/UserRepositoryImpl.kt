@@ -105,18 +105,21 @@ class UserRepositoryImpl(
         // Only retrieve again after 3 minutes or it's forced.
         if (forced || lastSync == null || Date().time - (lastSync?.time ?: 0) > 180000) {
             val user = apiClient.retrieveUser(withTasks) ?: return null
-            lastSync = Date()
-            withContext(Dispatchers.Main) {
+            val accepted = withContext(Dispatchers.Main) {
+                if (!userReadIsCurrent(user)) return@withContext false
                 localRepository.saveUser(user)
-            }
-            if (withTasks) {
-                val id = user.id
-                val tasksOrder = user.tasksOrder
-                val tasks = user.tasks
-                if (id != null && tasksOrder != null && tasks != null) {
-                    taskRepository.saveTasks(id, tasksOrder, tasks)
+                if (withTasks) {
+                    val id = user.id
+                    val tasksOrder = user.tasksOrder
+                    val tasks = user.tasks
+                    if (id != null && tasksOrder != null && tasks != null) {
+                        taskRepository.saveTasks(id, tasksOrder, tasks)
+                    }
                 }
+                lastSync = Date()
+                true
             }
+            if (!accepted || !userReadIsCurrent(user)) return null
             val calendar = GregorianCalendar()
             val timeZone = calendar.timeZone
             val offset = -TimeUnit.MINUTES.convert(timeZone.getOffset(calendar.timeInMillis).toLong(), TimeUnit.MILLISECONDS)
@@ -129,6 +132,10 @@ class UserRepositoryImpl(
             return null
         }
     }
+
+    /** Rejects network snapshots superseded while waiting for the Main-thread save boundary. */
+    private fun userReadIsCurrent(user: User): Boolean =
+        user.taskReadGeneration?.let { it == apiClient.taskReadGeneration } ?: true
 
     override suspend fun revive(): Equipment? {
         val items = apiClient.revive()

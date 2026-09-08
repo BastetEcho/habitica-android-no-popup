@@ -886,9 +886,9 @@ class TaskFormActivity : BaseActivity() {
             if (task?.isValid != true) return@addButton
 
             task?.id?.let {
+                val taskCopy = task?.let { current -> taskRepository.getUnmanagedCopy(current) }
                 lifecycleScope.launch(Dispatchers.Main) {
                     taskRepository.deleteTask(it)
-                    val taskCopy = task
                     taskCopy?.let { taskAlarmManager.removeAlarmsForTask(it) }
                     WidgetRefreshWorker.enqueueOneTime(applicationContext)
                 }

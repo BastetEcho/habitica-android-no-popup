@@ -8,6 +8,10 @@ import com.habitrpg.android.habitica.R
 import com.habitrpg.android.habitica.api.ApiService
 import com.habitrpg.android.habitica.api.GSonFactoryCreator
 import com.habitrpg.android.habitica.data.ApiClient
+import com.habitrpg.android.habitica.data.TaskReadGeneration
+import com.habitrpg.android.habitica.data.sync.RetrofitTodoRemoteApi
+import com.habitrpg.android.habitica.data.sync.TodoRemoteApi
+import com.habitrpg.android.habitica.data.sync.TodoRequestScope
 import com.habitrpg.android.habitica.helpers.Analytics
 import com.habitrpg.android.habitica.helpers.NotificationsManager
 import com.habitrpg.android.habitica.models.Achievement
@@ -53,9 +57,11 @@ import com.habitrpg.shared.habitica.models.responses.TaskDirectionData
 import com.habitrpg.shared.habitica.models.responses.VerifyEmailResponse
 import com.habitrpg.shared.habitica.models.responses.VerifyUsernameResponse
 import okhttp3.Cache
+import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.logging.HttpLoggingInterceptor
+import kotlinx.coroutines.CancellationException
 import org.json.JSONObject
 import retrofit2.Converter
 import retrofit2.HttpException
@@ -64,23 +70,39 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import java.io.File
 import java.io.IOException
-import java.net.SocketException
-import java.net.SocketTimeoutException
-import java.net.UnknownHostException
 import java.util.Date
 import java.util.GregorianCalendar
 import java.util.concurrent.TimeUnit
-import javax.net.ssl.SSLException
+import java.util.concurrent.atomic.AtomicLong
 
 class ApiClientImpl(
     private val converter: Converter.Factory,
     override val hostConfig: HostConfig,
     private val notificationsManager: NotificationsManager,
-    private val context: Context
+    private val context: Context,
+    private val httpClientBuilder: () -> OkHttpClient.Builder = { OkHttpClient.Builder() }
 ) : ApiClient {
     private lateinit var retrofitAdapter: Retrofit
 
     private lateinit var apiService: ApiService
+
+    private val taskReads = AtomicLong(0)
+
+    /** Exposes a process-local fence without persisting transport state in task models. */
+    override val taskReadGeneration: Long
+        get() = taskReads.get()
+
+    /** Makes all reads begun before the latest accepted mutation ineligible for saving. */
+    override fun invalidateTaskReads() {
+        taskReads.incrementAndGet()
+    }
+
+    /** Captures the current service without retaining a gateway across account or server changes. */
+    override val todoRemoteApi: TodoRemoteApi
+        get() {
+            val service = apiService
+            return RetrofitTodoRemoteApi(service, TodoRequestScope(hostConfig) { apiService === service })
+        }
 
     private fun <T> processResponse(response: Response<HabitResponse<T>>): T? {
         val habitResponse = response.body()
@@ -92,6 +114,39 @@ class ApiClientImpl(
             notificationsManager.setNotifications(it)
         }
         return habitResponse?.data
+    }
+
+    /** Captures one fence shared by every HTTP leg of a logical task/user refresh. */
+    private fun newTaskRead(): TaskReadGeneration =
+        TaskReadGeneration(taskReadGeneration) { taskReadGeneration }
+
+    /** Discards superseded reads before callbacks while preserving normal current-read errors. */
+    private suspend fun <T> readTaskResponse(
+        read: TaskReadGeneration,
+        apiCall: suspend () -> Response<HabitResponse<T>>
+    ): Response<HabitResponse<T>>? {
+        return try {
+            val response = apiCall()
+            if (!read.isCurrent()) return null
+            if (!response.isSuccessful) throw HttpException(response)
+            response
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            if (read.isCurrent()) accept(failure)
+            null
+        }
+    }
+
+    /** Marks accepted network lists so repositories can recheck after coroutine dispatch. */
+    private suspend fun readTasks(
+        apiCall: suspend (TaskReadGeneration) -> Response<HabitResponse<TaskList>>
+    ): TaskList? {
+        val read = newTaskRead()
+        val response = readTaskResponse(read) { apiCall(read) } ?: return null
+        if (!read.isCurrent()) return null
+        val tasks = processResponse(response)?.apply { readGeneration = read.value }
+        return tasks?.takeIf { read.isCurrent() }
     }
 
     private suspend fun <T> process(apiCall: suspend () -> Response<HabitResponse<T>>): T? {
@@ -139,6 +194,8 @@ class ApiClientImpl(
     }
 
     private fun buildRetrofit() {
+        val replacingService = ::apiService.isInitialized
+        if (replacingService) invalidateTaskReads()
         val logging = HttpLoggingInterceptor()
         if (BuildConfig.DEBUG) {
             logging.level = HttpLoggingInterceptor.Level.BODY
@@ -159,12 +216,15 @@ class ApiClientImpl(
         val cache = Cache(File(context.cacheDir, "http_cache"), cacheSize)
 
         val client =
-            OkHttpClient.Builder()
+            httpClientBuilder()
                 .cache(cache)
                 .addNetworkInterceptor { chain ->
                     val original = chain.request()
-                    var builder: Request.Builder = original.newBuilder()
-                    if (this.hostConfig.hasAuthentication()) {
+                    val todoScope = original.tag(TodoRequestScope::class.java)
+                    val taskRead = original.tag(TaskReadGeneration::class.java)
+                    if (taskRead?.isCurrent() == false) throw IOException("Task read superseded")
+                    var builder: Request.Builder = todoScope?.authenticate(original) ?: original.newBuilder()
+                    if (todoScope == null && this.hostConfig.hasAuthentication()) {
                         builder =
                             builder
                                 .header("x-api-key", this.hostConfig.apiKey)
@@ -182,8 +242,14 @@ class ApiClientImpl(
                     val request =
                         builder.method(original.method, original.body)
                             .build()
-                    lastAPICallURL = original.url.toString()
+                    if (taskRead?.isCurrent() == false) throw IOException("Task read superseded")
+                    if (todoScope == null) lastAPICallURL = original.url.toString()
                     val response = chain.proceed(request)
+                    if (todoScope != null || taskRead?.isCurrent() == false) {
+                        // Replay owns HTTP failure handling and must not log out or show UI from an old request.
+                        return@addNetworkInterceptor response.newBuilder()
+                            .header("Cache-Control", "no-store").build()
+                    }
                     if (response.isSuccessful) {
                         hideConnectionProblemDialog()
                         return@addNetworkInterceptor response
@@ -230,20 +296,40 @@ class ApiClientImpl(
                         }
                     }
                 }
-                .addInterceptor(logging)
+                .addInterceptor { chain ->
+                    if (chain.request().tag(TodoRequestScope::class.java) == null) {
+                        logging.intercept(chain)
+                    } else {
+                        // Persisted task bodies and captured authentication stay out of debug logs.
+                        chain.proceed(chain.request())
+                    }
+                }
                 .readTimeout(2400, TimeUnit.SECONDS)
                 .build()
+
+        val todoClient = client.newBuilder()
+            .callTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .build()
 
         val server = Server(this.hostConfig.address)
 
         retrofitAdapter =
             Retrofit.Builder()
-                .client(client)
+                .callFactory(object : Call.Factory {
+                    /** Selects bounded replay timeouts before the call starts, preserving normal requests. */
+                    override fun newCall(request: Request): Call =
+                        (if (request.tag(TodoRequestScope::class.java) == null) client else todoClient)
+                            .newCall(request)
+                })
                 .baseUrl(server.toString())
                 .addConverterFactory(converter)
                 .build()
 
         this.apiService = retrofitAdapter.create(ApiService::class.java)
+        if (replacingService) invalidateTaskReads()
     }
 
     override fun updateServerUrl(newAddress: String?) {
@@ -323,22 +409,13 @@ class ApiClientImpl(
 
     fun accept(throwable: Throwable) {
         val throwableClass = throwable.javaClass
-        if (SocketTimeoutException::class.java.isAssignableFrom(throwableClass)) {
+        if (throwable is IOException) {
+            // Offline operation is normal; pending Todo work retries without connectivity warnings.
             return
         }
 
         var isUserInputCall = false
-        @Suppress("DEPRECATION")
-        if (SocketException::class.java.isAssignableFrom(throwableClass) ||
-            SSLException::class.java.isAssignableFrom(throwableClass)
-        ) {
-            this.showConnectionProblemDialog(R.string.internal_error_api, isUserInputCall)
-        } else if (throwableClass == SocketTimeoutException::class.java || UnknownHostException::class.java == throwableClass || IOException::class.java == throwableClass) {
-            this.showConnectionProblemDialog(
-                R.string.network_error_no_network_body,
-                isUserInputCall
-            )
-        } else if (HttpException::class.java.isAssignableFrom(throwable.javaClass)) {
+        if (HttpException::class.java.isAssignableFrom(throwable.javaClass)) {
             val error = throwable as HttpException
             val res = getErrorResponse(error)
             val status = error.code()
@@ -408,10 +485,21 @@ class ApiClientImpl(
     }
 
     override suspend fun retrieveUser(withTasks: Boolean): User? {
-        val user = process { apiService.getUser("balance,items,permissions,challenges,lastCron,needsCron,loginIncentives,achievements,backer,contributor,purchased,invitations,party,profile,stats,tasksOrder,pushDevices,tags,pinnedItems,unpinnedItems,pinnedItemsOrder") }
-        val tasks = getTasks()
-        user?.tasks = tasks
-        return user
+        val read = newTaskRead()
+        val userResponse = readTaskResponse(read) {
+            apiService.getUser("balance,items,permissions,challenges,lastCron,needsCron,loginIncentives,achievements,backer,contributor,purchased,invitations,party,profile,stats,tasksOrder,pushDevices,tags,pinnedItems,unpinnedItems,pinnedItemsOrder", read)
+        } ?: return null
+        if (userResponse.body()?.data == null) return null
+        val tasksResponse = if (withTasks) {
+            readTaskResponse(read) { apiService.getTasks(false, read) }
+        } else {
+            null
+        }
+        if (!read.isCurrent()) return null
+        val user = processResponse(userResponse) ?: return null
+        user.tasks = tasksResponse?.let { processResponse(it) }?.apply { readGeneration = read.value }
+        user.taskReadGeneration = read.value
+        return user.takeIf { read.isCurrent() }
     }
 
     override suspend fun retrieveInboxMessages(
@@ -487,8 +575,10 @@ class ApiClientImpl(
         userID: String?,
         apiToken: String?
     ) {
+        invalidateTaskReads()
         this.hostConfig.userID = userID ?: ""
         this.hostConfig.apiKey = apiToken ?: ""
+        invalidateTaskReads()
         Analytics.setUserID(hostConfig.userID)
     }
 
@@ -622,17 +712,17 @@ class ApiClientImpl(
         return process { apiService.hatchPet(eggKey, hatchingPotionKey) }
     }
 
-    override suspend fun getTasks(): TaskList? = process { apiService.getTasks(false) }
+    override suspend fun getTasks(): TaskList? = readTasks { apiService.getTasks(false, it) }
 
     override suspend fun getTasks(type: String): TaskList? {
-        return process { apiService.getTasks(type) }
+        return readTasks { apiService.getTasks(type, it) }
     }
 
     override suspend fun getTasks(
         type: String,
         dueDate: String
     ): TaskList? {
-        return process { apiService.getTasks(type, dueDate) }
+        return readTasks { apiService.getTasks(type, dueDate, it) }
     }
 
 //    override suspend fun reorderTags(type: String, dueDate: String): {
