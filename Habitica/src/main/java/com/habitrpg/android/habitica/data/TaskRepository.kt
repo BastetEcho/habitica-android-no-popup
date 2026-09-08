@@ -14,6 +14,9 @@ import java.util.Date
 interface TaskRepository : BaseRepository {
     fun refreshLocalData()
 
+    /** Drains durable personal Todo requests without foreground feedback; false requests retry. */
+    suspend fun syncPendingTodos(): Boolean
+
     fun getTasks(
         taskType: TaskType,
         userID: String? = null,

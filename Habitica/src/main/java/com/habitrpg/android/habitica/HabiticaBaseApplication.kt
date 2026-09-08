@@ -15,10 +15,12 @@ import android.util.Log
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.content.edit
 import androidx.core.os.LocaleListCompat
+import androidx.hilt.work.HiltWorkerFactory
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.preference.PreferenceManager
+import androidx.work.Configuration
 import com.google.android.gms.wearable.Wearable
 import com.google.firebase.installations.FirebaseInstallations
 import com.google.firebase.remoteconfig.ConfigUpdate
@@ -27,6 +29,7 @@ import com.google.firebase.remoteconfig.FirebaseRemoteConfig
 import com.google.firebase.remoteconfig.FirebaseRemoteConfigException
 import com.google.firebase.remoteconfig.FirebaseRemoteConfigSettings
 import com.habitrpg.android.habitica.data.ApiClient
+import com.habitrpg.android.habitica.data.sync.TodoSyncScheduler
 import com.habitrpg.android.habitica.extensions.DateUtils
 import com.habitrpg.android.habitica.helpers.AdHandler
 import com.habitrpg.android.habitica.helpers.Analytics
@@ -102,7 +105,8 @@ class ApplicationLifecycleTracker(private val sharedPreferences: SharedPreferenc
 }
 
 @HiltAndroidApp
-abstract class HabiticaBaseApplication : Application(), Application.ActivityLifecycleCallbacks {
+abstract class HabiticaBaseApplication : Application(), Application.ActivityLifecycleCallbacks,
+    Configuration.Provider {
     @Inject
     internal lateinit var lazyApiHelper: ApiClient
 
@@ -114,6 +118,16 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
 
     @Inject
     internal lateinit var authenticationHandler: AuthenticationHandler
+
+    @Inject
+    internal lateinit var workerFactory: HiltWorkerFactory
+
+    @Inject
+    internal lateinit var todoSyncScheduler: TodoSyncScheduler
+
+    /** Supplies injected Todo workers while retaining WorkManager's fallback for ordinary workers. */
+    override val workManagerConfiguration: Configuration
+        get() = Configuration.Builder().setWorkerFactory(workerFactory).build()
 
     private lateinit var lifecycleTracker: ApplicationLifecycleTracker
 
@@ -133,6 +147,7 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
         }
         registerActivityLifecycleCallbacks(this)
         setupRealm()
+        todoSyncScheduler.schedule()
         setLocale()
         setupLocaleChangeListener()
         setupRemoteConfig()
@@ -246,6 +261,8 @@ abstract class HabiticaBaseApplication : Application(), Application.ActivityLife
         Realm.init(this)
         val builder =
             RealmConfiguration.Builder()
+                // Keep the previous offline outbox in its original Realm for later recovery.
+                .name("baseline-rc3.realm")
                 .schemaVersion(1)
                 .deleteRealmIfMigrationNeeded()
                 .allowWritesOnUiThread(true)

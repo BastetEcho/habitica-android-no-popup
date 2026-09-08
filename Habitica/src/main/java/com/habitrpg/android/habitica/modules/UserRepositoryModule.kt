@@ -41,6 +41,10 @@ import com.habitrpg.android.habitica.data.local.implementation.RealmTaskLocalRep
 import com.habitrpg.android.habitica.data.local.implementation.RealmTutorialLocalRepository
 import com.habitrpg.android.habitica.data.local.implementation.RealmUserLocalRepository
 import com.habitrpg.android.habitica.helpers.AppConfigManager
+import com.habitrpg.android.habitica.data.sync.SqliteTodoOutboxStore
+import com.habitrpg.android.habitica.data.sync.TodoOutbox
+import com.habitrpg.android.habitica.data.sync.TodoScope
+import com.habitrpg.android.habitica.data.sync.TodoSyncScheduler
 import com.habitrpg.android.habitica.helpers.PurchaseHandler
 import com.habitrpg.android.habitica.ui.viewmodels.MainUserViewModel
 import dagger.Module
@@ -71,15 +75,35 @@ class UserRepositoryModule {
         localRepository: TaskLocalRepository,
         apiClient: ApiClient,
         authenticationHandler: AuthenticationHandler,
-        appConfigManager: AppConfigManager
+        appConfigManager: AppConfigManager,
+        todoOutbox: TodoOutbox
     ): TaskRepository {
         return TaskRepositoryImpl(
             localRepository,
             apiClient,
             authenticationHandler,
-            appConfigManager
+            appConfigManager,
+            todoOutbox
         )
     }
+
+    /** Shares a single replay mutex while keeping every Realm-backed repository thread-local. */
+    @Provides
+    @Singleton
+    fun providesTodoOutbox(
+        store: SqliteTodoOutboxStore,
+        apiClient: ApiClient,
+        scheduler: TodoSyncScheduler
+    ): TodoOutbox = TodoOutbox(
+        store,
+        currentScope = {
+            apiClient.hostConfig.takeIf { it.hasAuthentication() }
+                ?.let { TodoScope(it.address, it.userID) }
+        },
+        remoteForScope = { apiClient.todoRemoteApi.forAccount(it.server, it.userId) },
+        schedule = scheduler::schedule,
+        invalidateReads = apiClient::invalidateTaskReads
+    )
 
     @Provides
     fun providesTagLocalRepository(realm: Realm): TagLocalRepository {

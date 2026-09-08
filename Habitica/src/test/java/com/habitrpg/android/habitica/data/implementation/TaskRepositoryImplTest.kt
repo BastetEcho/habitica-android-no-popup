@@ -25,6 +25,9 @@ import io.mockk.slot
 import io.mockk.spyk
 import io.mockk.verify
 import io.realm.Realm
+import io.realm.RealmQuery
+import io.realm.RealmResults
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import java.util.UUID
 import kotlin.time.Duration.Companion.milliseconds
@@ -35,9 +38,16 @@ class TaskRepositoryImplTest : WordSpec({
     val localRepository = mockk<TaskLocalRepository>()
     val apiClient = mockk<ApiClient>()
     beforeEach {
+        val transactionRealm = mockk<Realm>()
+        val siblingQuery = mockk<RealmQuery<Task>>()
+        val siblingTasks = mockk<RealmResults<Task>>()
+        every { transactionRealm.where(Task::class.java) } returns siblingQuery
+        every { siblingQuery.equalTo("id", any<String>()) } returns siblingQuery
+        every { siblingQuery.findAll() } returns siblingTasks
+        every { siblingTasks.iterator() } answers { mutableListOf<Task>().iterator() }
         val slot = slot<((Realm) -> Unit)>()
         every { localRepository.executeTransaction(transaction = capture(slot)) } answers {
-            slot.captured(mockk(relaxed = true))
+            slot.captured(transactionRealm)
         }
         val authenticationHandler = mockk<AuthenticationHandler>()
         every { authenticationHandler.currentUserID } answers {
@@ -65,11 +75,22 @@ class TaskRepositoryImplTest : WordSpec({
             verify { localRepository.saveTasks("", order, list) }
         }
     }
+    "getTasks" should {
+        "preserve the queryable Realm results used by task filters" {
+            val tasks = mockk<RealmResults<Task>>()
+            every { tasks.iterator() } answers { mutableListOf<Task>().iterator() }
+            every { localRepository.getTasks(TaskType.DAILY, "test-user", any()) } returns flowOf(tasks)
+
+            val result = repository.getTasks(TaskType.DAILY, "test-user", emptyArray()).first()
+
+            (result === tasks) shouldBe true
+        }
+    }
     "taskChecked" should {
-        val task = Task()
-        task.id = UUID.randomUUID().toString()
+        lateinit var task: Task
         lateinit var user: User
         beforeEach {
+            task = Task().apply { id = UUID.randomUUID().toString() }
             user = spyk(User())
             user.stats = Stats()
         }

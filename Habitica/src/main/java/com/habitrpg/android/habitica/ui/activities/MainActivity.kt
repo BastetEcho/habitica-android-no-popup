@@ -264,6 +264,7 @@ open class MainActivity : BaseActivity(), SnackbarActivity {
         super.onCreate(savedInstanceState)
 
         val preferences = PreferenceManager.getDefaultSharedPreferences(this)
+        migrateYesterdailiesPopupPreference(preferences)
         val step = preferences.getInt("last_onboarding_step", 0)
         if (!viewModel.isAuthenticated ||
             step == OnboardingSteps.SETUP.id ||
@@ -1119,10 +1120,24 @@ open class MainActivity : BaseActivity(), SnackbarActivity {
     }
 
     private fun handleStartDay(userId: String?) {
-        if (sharedPreferences.getBoolean(DISABLE_YESTERDAILIES_POPUP_KEY, false)) {
-            StartDayManager.runIfNeeded(userRepository)
-        } else {
+        if (sharedPreferences.getBoolean(YESTERDAILIES_POPUP_ENABLED_KEY, true)) {
             YesterdailyDialog.showDialogIfNeeded(this, userId, userRepository, taskRepository)
+        } else {
+            StartDayManager.runIfNeeded(userRepository)
+        }
+    }
+
+    private fun migrateYesterdailiesPopupPreference(preferences: SharedPreferences) {
+        if (preferences.contains(YESTERDAILIES_POPUP_ENABLED_KEY) ||
+            !preferences.contains(DISABLE_YESTERDAILIES_POPUP_KEY)
+        ) {
+            return
+        }
+
+        val popupEnabled = !preferences.getBoolean(DISABLE_YESTERDAILIES_POPUP_KEY, false)
+        preferences.edit {
+            putBoolean(YESTERDAILIES_POPUP_ENABLED_KEY, popupEnabled)
+            remove(DISABLE_YESTERDAILIES_POPUP_KEY)
         }
     }
 
@@ -1175,6 +1190,7 @@ open class MainActivity : BaseActivity(), SnackbarActivity {
         private const val PERSISTENT_DRAWER_MIN_WIDTH_DP = 600
         private const val DEFAULT_SCRIM_COLOR = 0x99000000.toInt()
         private const val DISABLE_YESTERDAILIES_POPUP_KEY = "disable_yesterdailies_popup"
+        private const val YESTERDAILIES_POPUP_ENABLED_KEY = "yesterdailies_popup_enabled"
         const val OPEN_TASK_FORM_TYPE = "openTaskFormType"
     }
 }

@@ -1,5 +1,6 @@
 package com.habitrpg.android.habitica.data
 
+import com.habitrpg.android.habitica.data.sync.TodoRemoteApi
 import com.habitrpg.android.habitica.models.Achievement
 import com.habitrpg.android.habitica.models.ContentResult
 import com.habitrpg.android.habitica.models.LeaveChallengeBody
@@ -41,6 +42,15 @@ import retrofit2.HttpException
 
 interface ApiClient {
     val hostConfig: HostConfig
+
+    /** Returns a quiet Todo gateway for the currently selected server and account. */
+    val todoRemoteApi: TodoRemoteApi
+
+    /** Identifies the latest locally accepted task mutation for in-flight read fencing. */
+    val taskReadGeneration: Long
+
+    /** Invalidates task/user snapshots started before a local mutation or synchronization receipt. */
+    fun invalidateTaskReads()
 
     suspend fun getStatus(): Status?
 
@@ -510,4 +520,10 @@ interface ApiClient {
         challengeid: String,
         updateData: Map<String, String>
     ): Void?
+}
+
+/** Carries only a process-local read fence, never credentials or persistent task content. */
+class TaskReadGeneration(val value: Long, private val current: () -> Long) {
+    /** Checks whether no accepted mutation has superseded this request. */
+    fun isCurrent(): Boolean = value == current()
 }

@@ -1,5 +1,8 @@
 package com.habitrpg.android.habitica.api
 
+import com.google.gson.JsonObject
+import com.habitrpg.android.habitica.data.TaskReadGeneration
+import com.habitrpg.android.habitica.data.sync.TodoRequestScope
 import com.habitrpg.android.habitica.models.Achievement
 import com.habitrpg.android.habitica.models.ContentResult
 import com.habitrpg.android.habitica.models.LeaveChallengeBody
@@ -44,10 +47,12 @@ import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.HTTP
 import retrofit2.http.Header
+import retrofit2.http.Headers
 import retrofit2.http.POST
 import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
+import retrofit2.http.Tag as RequestTag
 
 @JvmSuppressWildcards
 interface ApiService {
@@ -56,8 +61,12 @@ interface ApiService {
 
     // user API
 
+    @Headers("Cache-Control: no-cache, no-store")
     @GET("user/")
-    suspend fun getUser(@Query("fields") fields: String?): Response<HabitResponse<User>>
+    suspend fun getUser(
+        @Query("fields") fields: String?,
+        @RequestTag read: TaskReadGeneration? = null
+    ): Response<HabitResponse<User>>
 
     @POST("user/stat-sync")
     suspend fun syncUserStats(): Response<HabitResponse<User>>
@@ -71,8 +80,12 @@ interface ApiService {
     @GET("inbox/conversations")
     suspend fun getInboxConversations(): Response<HabitResponse<List<InboxConversation>>>
 
+    @Headers("Cache-Control: no-cache, no-store")
     @GET("tasks/user")
-    suspend fun getTasks(@Query("history") history: Boolean?): Response<HabitResponse<TaskList>>
+    suspend fun getTasks(
+        @Query("history") history: Boolean?,
+        @RequestTag read: TaskReadGeneration? = null
+    ): Response<HabitResponse<TaskList>>
 
     @GET("world-state")
     suspend fun worldState(): Response<HabitResponse<WorldState>>
@@ -153,15 +166,19 @@ interface ApiService {
         @Path("hatchingPotion") hatchingPotionKey: String
     ): Response<HabitResponse<Items>>
 
-    @GET("tasks/user")
-    suspend fun getTasks(
-        @Query("type") type: String
-    ): Response<HabitResponse<TaskList>>
-
+    @Headers("Cache-Control: no-cache, no-store")
     @GET("tasks/user")
     suspend fun getTasks(
         @Query("type") type: String,
-        @Query("dueDate") dueDate: String
+        @RequestTag read: TaskReadGeneration? = null
+    ): Response<HabitResponse<TaskList>>
+
+    @Headers("Cache-Control: no-cache, no-store")
+    @GET("tasks/user")
+    suspend fun getTasks(
+        @Query("type") type: String,
+        @Query("dueDate") dueDate: String,
+        @RequestTag read: TaskReadGeneration? = null
     ): Response<HabitResponse<TaskList>>
 
     @POST("user/unlock")
@@ -229,6 +246,65 @@ interface ApiService {
     suspend fun deleteTask(
         @Path("id") id: String
     ): Response<HabitResponse<Void>>
+
+    /** Reads authoritative rewards for queued scoring without normal refresh callbacks. */
+    @Headers("Cache-Control: no-cache, no-store")
+    @GET("user/")
+    suspend fun getTodoUser(
+        @Query("fields") fields: String,
+        @RequestTag scope: TodoRequestScope
+    ): Response<HabitResponse<User>>
+
+    /** Reads authoritative task state for outbox reconciliation, without cached responses. */
+    @Headers("Cache-Control: no-cache, no-store")
+    @GET("tasks/{id}")
+    suspend fun findTodo(@Path("id") id: String, @RequestTag scope: TodoRequestScope): Response<HabitResponse<Task>>
+
+    /** Sends a persisted task body without the Task model serializer. */
+    @Headers("Cache-Control: no-cache, no-store")
+    @POST("tasks/user")
+    suspend fun createTodo(@Body payload: JsonObject, @RequestTag scope: TodoRequestScope): Response<HabitResponse<Task>>
+
+    /** Sends all persisted edit fields to the normal task endpoint. */
+    @Headers("Cache-Control: no-cache, no-store")
+    @PUT("tasks/{id}")
+    suspend fun updateTodo(
+        @Path("id") id: String,
+        @Body payload: JsonObject,
+        @RequestTag scope: TodoRequestScope
+    ): Response<HabitResponse<Task>>
+
+    /** Scores a queued task through the full server operation. */
+    @Headers("Cache-Control: no-cache, no-store")
+    @POST("tasks/{id}/score/{direction}")
+    suspend fun scoreTodo(
+        @Path("id") id: String,
+        @Path("direction") direction: String,
+        @RequestTag scope: TodoRequestScope
+    ): Response<HabitResponse<TaskDirectionData>>
+
+    /** Toggles a queued checklist item through the original score endpoint. */
+    @Headers("Cache-Control: no-cache, no-store")
+    @POST("tasks/{taskId}/checklist/{itemId}/score")
+    suspend fun scoreTodoChecklist(
+        @Path("taskId") id: String,
+        @Path("itemId") itemId: String,
+        @RequestTag scope: TodoRequestScope
+    ): Response<HabitResponse<Task>>
+
+    /** Deletes a queued task while preserving the actual HTTP outcome. */
+    @Headers("Cache-Control: no-cache, no-store")
+    @DELETE("tasks/{id}")
+    suspend fun deleteTodo(@Path("id") id: String, @RequestTag scope: TodoRequestScope): Response<HabitResponse<Void>>
+
+    /** Moves a queued task through the normal task ordering endpoint. */
+    @Headers("Cache-Control: no-cache, no-store")
+    @POST("tasks/{id}/move/to/{position}")
+    suspend fun moveTodo(
+        @Path("id") id: String,
+        @Path("position") position: Int,
+        @RequestTag scope: TodoRequestScope
+    ): Response<HabitResponse<List<String>>>
 
     @POST("tags")
     suspend fun createTag(
