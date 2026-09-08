@@ -11,6 +11,7 @@ import com.habitrpg.android.habitica.data.sync.TodoRemoteApi
 import com.habitrpg.android.habitica.data.sync.TodoScope
 import com.habitrpg.android.habitica.data.sync.TodoTaskCodec
 import com.habitrpg.android.habitica.helpers.AppConfigManager
+import com.habitrpg.android.habitica.models.BaseObject
 import com.habitrpg.android.habitica.models.tasks.Task
 import com.habitrpg.android.habitica.models.tasks.TaskList
 import com.habitrpg.android.habitica.models.user.User
@@ -335,11 +336,14 @@ private class OfflineRepositoryFixture {
             val task = firstArg<Task>()
             rows[requireNotNull(task.id)] = task
         }
-        every { local.save(any<Task>()) } answers {
-            val task = firstArg<Task>()
-            rows[requireNotNull(task.id)] = task
+        every { local.save(any<BaseObject>()) } answers {
+            when (val saved = firstArg<BaseObject>()) {
+                is Task -> rows[requireNotNull(saved.id)] = saved
+                is User -> savedUsers.add(saved)
+                else -> error("Unexpected saved fixture type")
+            }
+            Unit
         }
-        every { local.save(any<User>()) } answers { savedUsers.add(firstArg()); Unit }
         every { realm.where(Task::class.java) } answers { query() }
         every { local.getTask(any()) } answers { rows[firstArg<String>()]?.let { flowOf(it) } ?: emptyFlow() }
         every { local.getTaskCopy(any()) } answers { rows[firstArg<String>()]?.let { flowOf(it) } ?: emptyFlow() }

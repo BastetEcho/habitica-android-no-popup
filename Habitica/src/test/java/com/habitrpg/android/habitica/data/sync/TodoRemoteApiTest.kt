@@ -126,7 +126,7 @@ class TodoRemoteApiTest : WordSpec({
         }
 
         "accept a successful empty delete response" {
-            coEvery { service.deleteTodo("example-task", scope) } returns Response.success(204, null)
+            coEvery { service.deleteTodo("example-task", scope) } returns Response.success<HabitResponse<Void>>(204, null)
 
             remote.delete("example-task")
             coVerify(exactly = 1) { service.deleteTodo("example-task", scope) }
